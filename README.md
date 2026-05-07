@@ -27,4 +27,4 @@ dotnet publish .\MonitorApp.csproj -c Release -r win-x64 --self-contained true -
 
 ## Download
 
-Built exe is in `dist/WindowHome.exe` until GitHub Release upload is configured.
+Download the latest `WindowHome.exe` from the GitHub Releases page.
