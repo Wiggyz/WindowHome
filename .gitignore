@@ -1,0 +1,8 @@
+﻿bin/
+obj/
+*.user
+*.suo
+.vs/
+published app/
+published app single/
+github-upload/
