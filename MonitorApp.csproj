@@ -16,6 +16,9 @@
     <Compile Remove="published app\source\**\*.cs" />
     <Page Remove="published app\source\**\*.xaml" />
     <None Remove="published app\source\**\*" />
+    <Compile Remove="github-upload\**\*.cs" />
+    <Page Remove="github-upload\**\*.xaml" />
+    <None Remove="github-upload\**\*" />
   </ItemGroup>
 
   <ItemGroup>

@@ -16,6 +16,7 @@ public partial class MainWindow : Window
 {
     private const string AppName = "WindowHome";
     private const string PreviousAppName = "App Auto Monitor Switcher";
+    private const string MinimizedToTrayArgument = "--minimized-to-tray";
     private const int MinimumWindowWidth = 1360;
     private const int MinimumWindowHeight = 860;
     private const int WmGetMinMaxInfo = 0x0024;
@@ -95,6 +96,10 @@ public partial class MainWindow : Window
         _pollTimer.Start();
         _iconAnimationTimer.Start();
         SetStatus($"Rules stored: {_stateService.SettingsPath}");
+        if (_settings.MinimizeToTray && ShouldStartMinimizedToTray())
+        {
+            Dispatcher.BeginInvoke(HideToTray);
+        }
     }
 
     private void MainWindow_SourceInitialized(object? sender, EventArgs e)
@@ -534,6 +539,10 @@ public partial class MainWindow : Window
 
         _settings.MinimizeToTray = MinimizeToTrayCheck.IsChecked == true;
         SaveSettings();
+        if (AutoStartCheck.IsChecked == true)
+        {
+            SetAutoStart(true, _settings.MinimizeToTray);
+        }
     }
 
     private void AutoStartCheck_Changed(object sender, RoutedEventArgs e)
@@ -545,7 +554,7 @@ public partial class MainWindow : Window
 
         try
         {
-            SetAutoStart(AutoStartCheck.IsChecked == true);
+            SetAutoStart(AutoStartCheck.IsChecked == true, MinimizeToTrayCheck.IsChecked == true);
             SetStatus(AutoStartCheck.IsChecked == true ? "Autostart enabled." : "Autostart disabled.");
         }
         catch (Exception ex)
@@ -869,7 +878,13 @@ public partial class MainWindow : Window
             && value.Contains(currentPath, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static void SetAutoStart(bool enabled)
+    private static bool ShouldStartMinimizedToTray()
+    {
+        return Environment.GetCommandLineArgs()
+            .Any(argument => string.Equals(argument, MinimizedToTrayArgument, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void SetAutoStart(bool enabled, bool startMinimizedToTray)
     {
         using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true)
             ?? Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true);
@@ -888,7 +903,10 @@ public partial class MainWindow : Window
         }
 
         key.DeleteValue(PreviousAppName, false);
-        key.SetValue(AppName, $"\"{currentPath}\"");
+        var command = startMinimizedToTray
+            ? $"\"{currentPath}\" {MinimizedToTrayArgument}"
+            : $"\"{currentPath}\"";
+        key.SetValue(AppName, command);
     }
 
     private delegate void WinEventDelegate(
