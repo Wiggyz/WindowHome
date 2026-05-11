@@ -1,0 +1,12 @@
+﻿bin/
+obj/
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+published app/
+published app single/
+github-upload/
+HANDOFF.md
+*.log
