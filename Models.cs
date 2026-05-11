@@ -12,21 +12,54 @@ public sealed class AppRule
 {
     public Guid Id { get; set; } = Guid.NewGuid();
     public bool Enabled { get; set; } = true;
+    public bool AutoStart { get; set; }
     public string DisplayName { get; set; } = "";
     public string ExecutablePath { get; set; } = "";
     public string ProcessName { get; set; } = "";
     public string TargetMonitorDeviceName { get; set; } = "";
     public string TargetMonitorLabel { get; set; } = "";
     public PlacementMode Mode { get; set; } = PlacementMode.Exact;
+    public SavedWindowState WindowState { get; set; } = SavedWindowState.Normal;
+    public bool UseTrayMinimize { get; set; }
+    public MinimizeToTrayAction TrayAction { get; set; } = MinimizeToTrayAction.MinimizeButton;
     public WindowPosition Position { get; set; } = new();
 
     [JsonIgnore]
     public string MatchLabel => string.IsNullOrWhiteSpace(ExecutablePath) ? ProcessName : ExecutablePath;
 
     [JsonIgnore]
-    public string PlacementLabel => Mode == PlacementMode.Maximized
-        ? "Maximized"
-        : $"{Position.Left},{Position.Top} {Position.Width}x{Position.Height}";
+    public SavedWindowState EffectiveWindowState => WindowState == SavedWindowState.Normal && Mode == PlacementMode.Maximized
+        ? SavedWindowState.Maximized
+        : WindowState == SavedWindowState.MinimizedToTray
+            ? SavedWindowState.Normal
+        : WindowState;
+
+    [JsonIgnore]
+    public bool EffectiveUseTrayMinimize => UseTrayMinimize || WindowState == SavedWindowState.MinimizedToTray;
+
+    [JsonIgnore]
+    public string PlacementLabel
+    {
+        get
+        {
+            var placement = EffectiveWindowState switch
+            {
+                SavedWindowState.Maximized => "Maximized",
+                SavedWindowState.MinimizedToTaskbar => $"Minimized to taskbar | {Position.Left},{Position.Top} {Position.Width}x{Position.Height}",
+                _ => $"{Position.Left},{Position.Top} {Position.Width}x{Position.Height}"
+            };
+
+            return EffectiveUseTrayMinimize
+                ? $"{placement} | tray via {TrayActionLabel}"
+                : placement;
+        }
+    }
+
+    [JsonIgnore]
+    public string AutomationLabel => AutoStart ? "Autostart enabled" : "";
+
+    [JsonIgnore]
+    public string TrayActionLabel => TrayAction == MinimizeToTrayAction.CloseButton ? "close button" : "minimize button";
 }
 
 public sealed class WindowPosition
@@ -41,6 +74,20 @@ public enum PlacementMode
 {
     Exact,
     Maximized
+}
+
+public enum SavedWindowState
+{
+    Normal,
+    Maximized,
+    MinimizedToTaskbar,
+    MinimizedToTray
+}
+
+public enum MinimizeToTrayAction
+{
+    MinimizeButton,
+    CloseButton
 }
 
 public sealed class MonitorInfo
@@ -80,9 +127,16 @@ public sealed class WindowInfo
     public string Title { get; init; } = "";
     public WindowRect Rect { get; init; } = new();
     public bool IsMaximized { get; init; }
+    public bool IsMinimized { get; init; }
+    public bool IsVisible { get; init; } = true;
+    public bool IsHidden { get; init; }
 
     public string DisplayLabel => $"{ProcessName} - {Title}";
+
+    public override string ToString() => DisplayLabel;
 }
+
+public readonly record struct RuleWindowAssignment(AppRule Rule, WindowInfo Window);
 
 public sealed class WindowRect
 {

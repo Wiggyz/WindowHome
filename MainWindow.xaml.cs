@@ -1,8 +1,12 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
+using System.Media;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -17,13 +21,14 @@ public partial class MainWindow : Window
     private const string AppName = "WindowHome";
     private const string PreviousAppName = "App Auto Monitor Switcher";
     private const string MinimizedToTrayArgument = "--minimized-to-tray";
-    private const int MinimumWindowWidth = 1360;
-    private const int MinimumWindowHeight = 860;
+    private const int MinimumWindowWidth = 760;
+    private const int MinimumWindowHeight = 620;
     private const int WmGetMinMaxInfo = 0x0024;
     private const uint EventObjectCreate = 0x8000;
     private const uint EventObjectShow = 0x8002;
     private const int ObjectIdWindow = 0;
     private const uint WinEventOutOfContext = 0x0000;
+    private static readonly int WmTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
 
     private readonly AppStateService _stateService = new();
     private readonly NativeWindowService _windowService = new();
@@ -31,9 +36,12 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _iconAnimationTimer;
     private readonly DispatcherTimer _windowEventDebounceTimer;
     private readonly HashSet<nint> _appliedWindows = [];
+    private readonly HashSet<Guid> _startupSuppressedRuleIds = [];
+    private readonly SoundPlayer _clickSoundPlayer = CreateClickSoundPlayer();
 
     private AppSettings _settings = new();
     private List<MonitorInfo> _monitors = [];
+    private List<WindowInfo> _allWindows = [];
     private List<WindowInfo> _windows = [];
     private AppRule? _selectedRule;
     private Forms.NotifyIcon? _trayIcon;
@@ -43,10 +51,12 @@ public partial class MainWindow : Window
     private nint _windowEventHook;
     private int _iconFrameIndex;
     private bool _exitRequested;
+    private bool _syncingStartupChecks;
 
     public MainWindow()
     {
         InitializeComponent();
+        AddHandler(System.Windows.Controls.Primitives.ButtonBase.ClickEvent, new RoutedEventHandler(AnyButton_Click), true);
 
         _pollTimer = new DispatcherTimer
         {
@@ -82,7 +92,10 @@ public partial class MainWindow : Window
         MinHeight = MinimumWindowHeight;
         _settings = _stateService.Load();
         MinimizeToTrayCheck.IsChecked = _settings.MinimizeToTray;
+        _syncingStartupChecks = true;
         AutoStartCheck.IsChecked = IsAutoStartEnabled();
+        ElevatedStartupCheck.IsChecked = TryGetElevatedStartupEnabled();
+        _syncingStartupChecks = false;
         ModeCombo.SelectedIndex = 0;
 
         EnsureAnimatedIcons();
@@ -91,8 +104,9 @@ public partial class MainWindow : Window
         RefreshAll();
         BindRules();
         ClearEditor();
+        MarkAlreadyRunningSavedAppsForStartupSkip();
         StartWindowEventHooks();
-        ApplySavedRules();
+        StartAutoStartRules();
         _pollTimer.Start();
         _iconAnimationTimer.Start();
         SetStatus($"Rules stored: {_stateService.SettingsPath}");
@@ -114,6 +128,11 @@ public partial class MainWindow : Window
     {
         if (msg != WmGetMinMaxInfo)
         {
+            if (msg == WmTaskbarCreated)
+            {
+                RestoreTrayIconAfterTaskbarRestart();
+            }
+
             return nint.Zero;
         }
 
@@ -147,8 +166,24 @@ public partial class MainWindow : Window
 
     private void RefreshWindows()
     {
+        if (ProcessCombo.IsDropDownOpen)
+        {
+            return;
+        }
+
         var selectedHandle = (ProcessCombo.SelectedItem as WindowInfo)?.Handle;
-        _windows = _windowService.GetOpenWindows().ToList();
+        _allWindows = _windowService.GetOpenWindows().ToList();
+        _windows = WindowDisplay.FilterForDropdown(_allWindows, WindowFilterBox.Text).ToList();
+        ProcessCombo.ItemsSource = _windows;
+        ProcessCombo.SelectedItem = _windows.FirstOrDefault(window => window.Handle == selectedHandle)
+            ?? _windows.FirstOrDefault();
+        UpdateWindowPreview();
+    }
+
+    private void ApplyWindowFilter()
+    {
+        var selectedHandle = (ProcessCombo.SelectedItem as WindowInfo)?.Handle;
+        _windows = WindowDisplay.FilterForDropdown(_allWindows, WindowFilterBox.Text).ToList();
         ProcessCombo.ItemsSource = _windows;
         ProcessCombo.SelectedItem = _windows.FirstOrDefault(window => window.Handle == selectedHandle)
             ?? _windows.FirstOrDefault();
@@ -203,29 +238,42 @@ public partial class MainWindow : Window
             _appliedWindows.Clear();
         }
 
-        foreach (var window in _windowService.GetOpenWindows())
+        var assignments = RuleAutomation.MatchRulesToWindows(
+            _settings.Rules.Where(rule => !_startupSuppressedRuleIds.Contains(rule.Id)),
+            _windowService.GetOpenWindows(),
+            (window, rule) => _windowService.Matches(window, rule),
+            _appliedWindows);
+
+        foreach (var assignment in assignments)
         {
-            if (_appliedWindows.Contains(window.Handle))
-            {
-                continue;
-            }
-
-            var rule = _settings.Rules.FirstOrDefault(savedRule => _windowService.Matches(window, savedRule));
-            if (rule is null)
-            {
-                continue;
-            }
-
-            var monitor = FindTargetMonitor(rule);
+            var monitor = FindTargetMonitor(assignment.Rule);
             if (monitor is null)
             {
                 continue;
             }
 
-            if (_windowService.ApplyRule(window, rule, monitor))
+            if (_windowService.ApplyRule(assignment.Window, assignment.Rule, monitor))
+            {
+                _appliedWindows.Add(assignment.Window.Handle);
+                SetStatus($"Moved {assignment.Window.ProcessName} to {monitor.DisplayName}");
+            }
+        }
+    }
+
+    private void MarkAlreadyRunningSavedAppsForStartupSkip()
+    {
+        foreach (var ruleId in RuleAutomation.GetAlreadyRunningRuleIds(_settings, GetRunningProcesses()))
+        {
+            _startupSuppressedRuleIds.Add(ruleId);
+        }
+
+        foreach (var window in _windowService.GetOpenWindows())
+        {
+            var matchingRule = _settings.Rules.FirstOrDefault(rule => _windowService.Matches(window, rule));
+            if (matchingRule is not null)
             {
                 _appliedWindows.Add(window.Handle);
-                SetStatus($"Moved {window.ProcessName} to {monitor.DisplayName}");
+                _startupSuppressedRuleIds.Add(matchingRule.Id);
             }
         }
     }
@@ -279,10 +327,14 @@ public partial class MainWindow : Window
             : Path.GetFileNameWithoutExtension(processName);
         rule.TargetMonitorDeviceName = monitor.DeviceName;
         rule.TargetMonitorLabel = monitor.DisplayName;
-        rule.Mode = ModeCombo.SelectedIndex == 1 ? PlacementMode.Maximized : PlacementMode.Exact;
+        rule.WindowState = ReadEditorWindowState();
+        rule.Mode = rule.WindowState == SavedWindowState.Maximized ? PlacementMode.Maximized : PlacementMode.Exact;
+        rule.UseTrayMinimize = ReadEditorUsesTrayMinimize();
+        rule.TrayAction = ReadEditorTrayAction();
+        rule.AutoStart = RuleAutoStartCheck.IsChecked == true;
         rule.Enabled = true;
 
-        if (rule.Mode == PlacementMode.Exact)
+        if (rule.WindowState != SavedWindowState.Maximized)
         {
             rule.Position = new WindowPosition
             {
@@ -339,17 +391,42 @@ public partial class MainWindow : Window
             return;
         }
 
+        var assignments = RuleAutomation.MatchRulesToWindows(
+            [_selectedRule],
+            _windowService.GetOpenWindows(),
+            (window, rule) => _windowService.Matches(window, rule));
         var moved = 0;
-        foreach (var window in _windowService.GetOpenWindows().Where(window => _windowService.Matches(window, _selectedRule)))
+        foreach (var assignment in assignments)
         {
-            if (_windowService.ApplyRule(window, _selectedRule, monitor))
+            if (_windowService.ApplyRule(assignment.Window, assignment.Rule, monitor))
             {
-                _appliedWindows.Add(window.Handle);
+                _appliedWindows.Add(assignment.Window.Handle);
                 moved++;
             }
         }
 
         SetStatus(moved == 0 ? "No matching open windows." : $"Moved {moved} window{(moved == 1 ? "" : "s")}.");
+    }
+
+    private void StartAppButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_selectedRule is null)
+        {
+            SetStatus("No rule selected.");
+            return;
+        }
+
+        try
+        {
+            if (StartAppForRule(_selectedRule))
+            {
+                SetStatus($"Started {_selectedRule.DisplayName}.");
+            }
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Start failed: {ex.Message}");
+        }
     }
 
     private void BrowseExeButton_Click(object sender, RoutedEventArgs e)
@@ -403,15 +480,16 @@ public partial class MainWindow : Window
 
         var position = _windowService.CapturePosition(window, monitor);
         MonitorCombo.SelectedItem = monitor;
-        ModeCombo.SelectedIndex = window.IsMaximized ? 1 : 0;
+        var state = _windowService.CaptureWindowState(window);
+        SetModeFromWindowState(state);
         LeftBox.Text = position.Left.ToString();
         TopBox.Text = position.Top.ToString();
         WidthBox.Text = position.Width.ToString();
         HeightBox.Text = position.Height.ToString();
 
-        SetStatus(window.IsMaximized
+        SetStatus(state == SavedWindowState.Maximized
             ? $"Captured {window.ProcessName} maximized on {monitor.DisplayName}."
-            : $"Captured {window.ProcessName} size {position.Width}x{position.Height} on {monitor.DisplayName}.");
+            : $"Captured {window.ProcessName} {DescribeWindowState(state)} at {position.Left},{position.Top} {position.Width}x{position.Height} on {monitor.DisplayName}.");
     }
 
     private void SaveCurrentPositionButton_Click(object sender, RoutedEventArgs e)
@@ -433,14 +511,17 @@ public partial class MainWindow : Window
             }
 
             var position = _windowService.CapturePosition(window, monitor);
-            var existingRule = _settings.Rules.FirstOrDefault(rule => _windowService.Matches(window, rule));
+            var existingRule = _selectedRule is not null && ShouldOverwriteSelectedRuleWithWindow(_selectedRule, window)
+                ? _selectedRule
+                : null;
             SelectRuleForOverwrite(existingRule);
 
             NameBox.Text = window.ProcessName;
             ProcessNameBox.Text = window.ProcessName;
             ExePathBox.Text = window.ExecutablePath;
             MonitorCombo.SelectedItem = monitor;
-            ModeCombo.SelectedIndex = window.IsMaximized ? 1 : 0;
+            var state = _windowService.CaptureWindowState(window);
+            SetModeFromWindowState(state);
             LeftBox.Text = position.Left.ToString();
             TopBox.Text = position.Top.ToString();
             WidthBox.Text = position.Width.ToString();
@@ -449,9 +530,10 @@ public partial class MainWindow : Window
             var savedRule = SaveRuleFromEditor();
             if (savedRule is not null)
             {
-                SetStatus(window.IsMaximized
+                _appliedWindows.Add(window.Handle);
+                SetStatus(state == SavedWindowState.Maximized
                     ? $"Overwrote {window.ProcessName}: maximized on {monitor.DisplayName}."
-                    : $"Overwrote {window.ProcessName}: {position.Width}x{position.Height} at {position.Left},{position.Top} on {monitor.DisplayName}.");
+                    : $"Saved {window.ProcessName}: {DescribeWindowState(state)} at {position.Left},{position.Top} {position.Width}x{position.Height} on {monitor.DisplayName}.");
             }
         }
         catch (Exception ex)
@@ -487,6 +569,25 @@ public partial class MainWindow : Window
         }
     }
 
+    private static bool ShouldOverwriteSelectedRuleWithWindow(AppRule rule, WindowInfo window)
+    {
+        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath) && !string.IsNullOrWhiteSpace(window.ExecutablePath))
+        {
+            return string.Equals(rule.ExecutablePath, window.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath))
+        {
+            return false;
+        }
+
+        return !string.IsNullOrWhiteSpace(rule.ProcessName)
+            && string.Equals(
+                Path.GetFileNameWithoutExtension(rule.ProcessName),
+                Path.GetFileNameWithoutExtension(window.ProcessName),
+                StringComparison.OrdinalIgnoreCase);
+    }
+
     private void NewRuleButton_Click(object sender, RoutedEventArgs e)
     {
         RulesList.SelectedItem = null;
@@ -506,7 +607,9 @@ public partial class MainWindow : Window
         ExePathBox.Text = _selectedRule.ExecutablePath;
         ProcessNameBox.Text = _selectedRule.ProcessName;
         MonitorCombo.SelectedItem = FindTargetMonitor(_selectedRule);
-        ModeCombo.SelectedIndex = _selectedRule.Mode == PlacementMode.Maximized ? 1 : 0;
+        SetModeFromWindowState(_selectedRule.EffectiveWindowState);
+        SetTrayActionFromRule(_selectedRule.EffectiveUseTrayMinimize, _selectedRule.TrayAction);
+        RuleAutoStartCheck.IsChecked = _selectedRule.AutoStart;
         LeftBox.Text = _selectedRule.Position.Left.ToString();
         TopBox.Text = _selectedRule.Position.Top.ToString();
         WidthBox.Text = _selectedRule.Position.Width.ToString();
@@ -517,6 +620,16 @@ public partial class MainWindow : Window
     private void ProcessCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         UpdateWindowPreview();
+    }
+
+    private void WindowFilterBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!IsLoaded || _syncingStartupChecks)
+        {
+            return;
+        }
+
+        ApplyWindowFilter();
     }
 
     private void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -543,11 +656,24 @@ public partial class MainWindow : Window
         {
             SetAutoStart(true, _settings.MinimizeToTray);
         }
+
+        if (ElevatedStartupCheck.IsChecked == true)
+        {
+            try
+            {
+                ElevatedStartupTask.SetEnabled(true, _settings.MinimizeToTray);
+            }
+            catch (Exception ex)
+            {
+                SetStatus($"Admin startup update failed: {CleanSchedulerMessage(ex.Message)}");
+                SetElevatedStartupCheck(TryGetElevatedStartupEnabled());
+            }
+        }
     }
 
     private void AutoStartCheck_Changed(object sender, RoutedEventArgs e)
     {
-        if (!IsLoaded)
+        if (!IsLoaded || _syncingStartupChecks)
         {
             return;
         }
@@ -556,11 +682,51 @@ public partial class MainWindow : Window
         {
             SetAutoStart(AutoStartCheck.IsChecked == true, MinimizeToTrayCheck.IsChecked == true);
             SetStatus(AutoStartCheck.IsChecked == true ? "Autostart enabled." : "Autostart disabled.");
+            if (AutoStartCheck.IsChecked == true && ElevatedStartupCheck.IsChecked == true)
+            {
+                SetElevatedStartupCheck(false);
+            }
         }
         catch (Exception ex)
         {
             SetStatus($"Autostart update failed: {ex.Message}");
-            AutoStartCheck.IsChecked = IsAutoStartEnabled();
+            SetAutoStartCheck(IsAutoStartEnabled());
+        }
+    }
+
+    private void ElevatedStartupCheck_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded || _syncingStartupChecks)
+        {
+            return;
+        }
+
+        if (ElevatedStartupCheck.IsChecked == true && !IsRunningAsAdministrator())
+        {
+            SetElevatedStartupCheck(false);
+            const string message = "Admin startup needs permission to create a Task Scheduler entry with administrator privileges. Restart WindowHome as administrator, then enable Admin startup again.";
+            System.Windows.MessageBox.Show(this, message, "Restart as administrator", MessageBoxButton.OK, MessageBoxImage.Information);
+            SetStatus("Admin startup requires restarting WindowHome as administrator.");
+            return;
+        }
+
+        try
+        {
+            ElevatedStartupTask.SetEnabled(ElevatedStartupCheck.IsChecked == true, MinimizeToTrayCheck.IsChecked == true);
+            if (ElevatedStartupCheck.IsChecked == true)
+            {
+                SetAutoStart(false, MinimizeToTrayCheck.IsChecked == true);
+                SetAutoStartCheck(false);
+            }
+
+            SetStatus(ElevatedStartupCheck.IsChecked == true
+                ? "Admin startup task enabled."
+                : "Admin startup task removed.");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Admin startup update failed: {CleanSchedulerMessage(ex.Message)}");
+            SetElevatedStartupCheck(TryGetElevatedStartupEnabled());
         }
     }
 
@@ -569,9 +735,98 @@ public partial class MainWindow : Window
         HideToTray();
     }
 
+    private void StartAutoStartRules()
+    {
+        var runningProcesses = GetRunningProcesses();
+        var allLaunchableRules = RuleAutomation.GetLaunchableAutoStartRules(_settings);
+        var launchableRules = RuleAutomation.GetLaunchableAutoStartRules(_settings, runningProcesses);
+        foreach (var ruleId in RuleAutomation.GetAlreadyRunningRuleIds(_settings, runningProcesses))
+        {
+            _startupSuppressedRuleIds.Add(ruleId);
+        }
+        var started = 0;
+        foreach (var rule in launchableRules)
+        {
+            if (StartAppForRule(rule))
+            {
+                started++;
+            }
+        }
+
+        var skipped = allLaunchableRules.Count - launchableRules.Count;
+        if (started > 0)
+        {
+            SetStatus(skipped > 0
+                ? $"Autostart launched {started} app{(started == 1 ? "" : "s")} and skipped {skipped} already running."
+                : $"Autostart launched {started} app{(started == 1 ? "" : "s")}.");
+        }
+        else if (skipped > 0)
+        {
+            SetStatus($"Autostart skipped {skipped} already running app{(skipped == 1 ? "" : "s")}.");
+        }
+    }
+
+    private static IReadOnlyList<RunningProcessInfo> GetRunningProcesses()
+    {
+        var processes = new List<RunningProcessInfo>();
+        foreach (var process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                var executablePath = "";
+                try
+                {
+                    executablePath = process.MainModule?.FileName ?? "";
+                }
+                catch
+                {
+                    executablePath = "";
+                }
+
+                try
+                {
+                    processes.Add(new RunningProcessInfo(process.ProcessName, executablePath));
+                }
+                catch
+                {
+                    // Process exited while scanning.
+                }
+            }
+        }
+
+        return processes;
+    }
+
+    private bool StartAppForRule(AppRule rule)
+    {
+        if (string.IsNullOrWhiteSpace(rule.ExecutablePath))
+        {
+            SetStatus("Selected rule has no executable path.");
+            return false;
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = rule.ExecutablePath,
+            UseShellExecute = true,
+            WindowStyle = rule.EffectiveWindowState == SavedWindowState.MinimizedToTaskbar
+                ? ProcessWindowStyle.Minimized
+                : ProcessWindowStyle.Normal
+        };
+
+        Process.Start(startInfo);
+        ScheduleApplySavedRules();
+        return true;
+    }
+
+    private void ScheduleApplySavedRules()
+    {
+        _ = Task.Delay(1800).ContinueWith(_ => Dispatcher.BeginInvoke(ApplySavedRules));
+    }
+
     private void MainWindow_StateChanged(object? sender, EventArgs e)
     {
-        if (WindowState == WindowState.Minimized && MinimizeToTrayCheck.IsChecked == true)
+        if (WindowState == WindowState.Minimized)
         {
             HideToTray();
         }
@@ -649,6 +904,12 @@ public partial class MainWindow : Window
 
     private void SetupTrayIcon()
     {
+        if (_trayIcon is not null)
+        {
+            _trayIcon.Visible = true;
+            return;
+        }
+
         var icon = _trayAnimationIcons.FirstOrDefault()
             ?? (Environment.ProcessPath is { Length: > 0 } processPath
             ? System.Drawing.Icon.ExtractAssociatedIcon(processPath) ?? System.Drawing.SystemIcons.Application
@@ -802,9 +1063,31 @@ public partial class MainWindow : Window
 
     private void HideToTray()
     {
+        SetupTrayIcon();
+        if (_trayIcon is not null)
+        {
+            _trayIcon.Visible = true;
+        }
+
         ShowInTaskbar = false;
         Hide();
         _trayIcon?.ShowBalloonTip(1000, AppName, "Still watching app windows.", Forms.ToolTipIcon.Info);
+    }
+
+    private void RestoreTrayIconAfterTaskbarRestart()
+    {
+        if (_trayIcon is null)
+        {
+            SetupTrayIcon();
+            return;
+        }
+
+        _trayIcon.Visible = false;
+        _trayIcon.Visible = true;
+        if (!IsVisible)
+        {
+            _trayIcon.ShowBalloonTip(1000, AppName, "WindowHome is still running.", Forms.ToolTipIcon.Info);
+        }
     }
 
     private void ShowFromTray()
@@ -824,7 +1107,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        WindowPreviewText.Text = $"{window.ProcessName} | PID {window.ProcessId} | {window.Rect.Left},{window.Rect.Top} {window.Rect.Width}x{window.Rect.Height}";
+        var state = _windowService.CaptureWindowState(window);
+        WindowPreviewText.Text = $"{window.ProcessName} | PID {window.ProcessId} | {DescribeWindowState(state)} | {window.Rect.Left},{window.Rect.Top} {window.Rect.Width}x{window.Rect.Height}";
     }
 
     private void UpdatePlacementVisibility()
@@ -844,6 +1128,8 @@ public partial class MainWindow : Window
         ExePathBox.Text = "";
         ProcessNameBox.Text = "";
         ModeCombo.SelectedIndex = 0;
+        TrayActionCombo.SelectedIndex = 0;
+        RuleAutoStartCheck.IsChecked = false;
         LeftBox.Text = "100";
         TopBox.Text = "80";
         WidthBox.Text = "1200";
@@ -861,6 +1147,149 @@ public partial class MainWindow : Window
     private void SetStatus(string message)
     {
         StatusText.Text = message;
+    }
+
+    private void AnyButton_Click(object sender, RoutedEventArgs e)
+    {
+        _clickSoundPlayer.Play();
+    }
+
+    private static SoundPlayer CreateClickSoundPlayer()
+    {
+        var stream = new MemoryStream(CreateClickWaveBytes());
+        var player = new SoundPlayer(stream);
+        player.Load();
+        return player;
+    }
+
+    private static byte[] CreateClickWaveBytes()
+    {
+        const int sampleRate = 44100;
+        const short channels = 1;
+        const short bitsPerSample = 16;
+        const int durationSamples = sampleRate / 55;
+        const int dataLength = durationSamples * channels * bitsPerSample / 8;
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream);
+
+        writer.Write("RIFF"u8.ToArray());
+        writer.Write(36 + dataLength);
+        writer.Write("WAVE"u8.ToArray());
+        writer.Write("fmt "u8.ToArray());
+        writer.Write(16);
+        writer.Write((short)1);
+        writer.Write(channels);
+        writer.Write(sampleRate);
+        writer.Write(sampleRate * channels * bitsPerSample / 8);
+        writer.Write((short)(channels * bitsPerSample / 8));
+        writer.Write(bitsPerSample);
+        writer.Write("data"u8.ToArray());
+        writer.Write(dataLength);
+
+        for (var i = 0; i < durationSamples; i++)
+        {
+            var envelope = Math.Pow(1.0 - (double)i / durationSamples, 4);
+            var tone = Math.Sin(2 * Math.PI * 2200 * i / sampleRate);
+            var sample = (short)(short.MaxValue * 0.34 * envelope * tone);
+            writer.Write(sample);
+        }
+
+        return stream.ToArray();
+    }
+
+    private SavedWindowState ReadEditorWindowState()
+    {
+        return ModeCombo.SelectedIndex switch
+        {
+            1 => SavedWindowState.Maximized,
+            2 => SavedWindowState.MinimizedToTaskbar,
+            _ => SavedWindowState.Normal
+        };
+    }
+
+    private bool ReadEditorUsesTrayMinimize()
+    {
+        return TrayActionCombo.SelectedIndex > 0;
+    }
+
+    private MinimizeToTrayAction ReadEditorTrayAction()
+    {
+        return TrayActionCombo.SelectedIndex == 2
+            ? MinimizeToTrayAction.CloseButton
+            : MinimizeToTrayAction.MinimizeButton;
+    }
+
+    private void SetModeFromWindowState(SavedWindowState state)
+    {
+        ModeCombo.SelectedIndex = state switch
+        {
+            SavedWindowState.Maximized => 1,
+            SavedWindowState.MinimizedToTaskbar => 2,
+            _ => 0
+        };
+    }
+
+    private void SetTrayActionFromRule(bool useTrayMinimize, MinimizeToTrayAction action)
+    {
+        if (!useTrayMinimize)
+        {
+            TrayActionCombo.SelectedIndex = 0;
+            return;
+        }
+
+        TrayActionCombo.SelectedIndex = action == MinimizeToTrayAction.CloseButton ? 2 : 1;
+    }
+
+    private static string DescribeWindowState(SavedWindowState state)
+    {
+        return state switch
+        {
+            SavedWindowState.Maximized => "maximized",
+            SavedWindowState.MinimizedToTaskbar => "minimized to taskbar",
+            SavedWindowState.MinimizedToTray => "minimized to tray",
+            _ => "windowed"
+        };
+    }
+
+    private static string CleanSchedulerMessage(string message)
+    {
+        return string.IsNullOrWhiteSpace(message)
+            ? "Task Scheduler did not return details. Try starting WindowHome as administrator."
+            : message.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal);
+    }
+
+    private static bool IsRunningAsAdministrator()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private bool TryGetElevatedStartupEnabled()
+    {
+        try
+        {
+            return ElevatedStartupTask.IsEnabled();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Could not read admin startup task: {CleanSchedulerMessage(ex.Message)}");
+            return false;
+        }
+    }
+
+    private void SetAutoStartCheck(bool value)
+    {
+        _syncingStartupChecks = true;
+        AutoStartCheck.IsChecked = value;
+        _syncingStartupChecks = false;
+    }
+
+    private void SetElevatedStartupCheck(bool value)
+    {
+        _syncingStartupChecks = true;
+        ElevatedStartupCheck.IsChecked = value;
+        _syncingStartupChecks = false;
     }
 
     private static int ReadInt(System.Windows.Controls.TextBox textBox, int fallback)
@@ -930,6 +1359,9 @@ public partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool UnhookWinEvent(nint hook);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int RegisterWindowMessage(string message);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Point

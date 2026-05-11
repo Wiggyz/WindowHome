@@ -49,18 +49,13 @@ public sealed class NativeWindowService
             return true;
         }, nint.Zero);
 
-        return windows
-            .OrderBy(window => window.ProcessName)
-            .ThenBy(window => window.Title)
-            .ToList();
+        return WindowDisplay.OrderForDropdown(windows);
     }
 
     public WindowInfo? GetWindowInfo(nint hwnd)
     {
-        if (!IsWindowVisible(hwnd))
-        {
-            return null;
-        }
+        var isVisible = IsWindowVisible(hwnd);
+        var isMinimized = IsIconic(hwnd);
 
         var titleLength = GetWindowTextLength(hwnd);
         if (titleLength == 0)
@@ -80,7 +75,7 @@ public sealed class NativeWindowService
             return null;
         }
 
-        if (!GetWindowRect(hwnd, out var rect) || rect.Width < 40 || rect.Height < 40)
+        if (!TryGetUsefulWindowRect(hwnd, isMinimized, out var rect) || rect.Width < 40 || rect.Height < 40)
         {
             return null;
         }
@@ -119,26 +114,49 @@ public sealed class NativeWindowService
                 Width = rect.Width,
                 Height = rect.Height
             },
-            IsMaximized = IsZoomed(hwnd)
+            IsMaximized = IsZoomed(hwnd),
+            IsMinimized = isMinimized,
+            IsVisible = isVisible,
+            IsHidden = !isVisible
         };
     }
 
     public bool ApplyRule(WindowInfo window, AppRule rule, MonitorInfo monitor)
     {
-        if (rule.Mode == PlacementMode.Maximized)
+        var state = rule.EffectiveWindowState;
+        bool moved;
+        if (state == SavedWindowState.Maximized)
         {
-            return MoveAndMaximize(window.Handle, monitor.WorkArea);
+            moved = MoveAndMaximize(window.Handle, monitor.WorkArea);
+        }
+        else
+        {
+            moved = MoveToExactPosition(window.Handle, rule, monitor);
         }
 
+        if (rule.EffectiveUseTrayMinimize)
+        {
+            TriggerTrayAction(window.Handle, rule.TrayAction);
+        }
+        else if (state == SavedWindowState.MinimizedToTaskbar)
+        {
+            ShowWindow(window.Handle, ShowWindowCommand.Minimize);
+        }
+
+        return moved;
+    }
+
+    private static bool MoveToExactPosition(nint hwnd, AppRule rule, MonitorInfo monitor)
+    {
         var position = rule.Position;
         var left = monitor.Bounds.Left + position.Left;
         var top = monitor.Bounds.Top + position.Top;
         var width = Math.Max(120, position.Width);
         var height = Math.Max(80, position.Height);
 
-        ShowWindow(window.Handle, ShowWindowCommand.Restore);
+        ShowWindow(hwnd, ShowWindowCommand.Restore);
         var positioned = SetWindowPos(
-            window.Handle,
+            hwnd,
             nint.Zero,
             left,
             top,
@@ -150,7 +168,7 @@ public sealed class NativeWindowService
             | SetWindowPositionFlags.NoActivate
             | SetWindowPositionFlags.FrameChanged);
 
-        var moved = MoveWindow(window.Handle, left, top, width, height, true);
+        var moved = MoveWindow(hwnd, left, top, width, height, true);
         return positioned || moved;
     }
 
@@ -188,6 +206,21 @@ public sealed class NativeWindowService
         };
     }
 
+    public SavedWindowState CaptureWindowState(WindowInfo window)
+    {
+        if (window.IsHidden)
+        {
+            return SavedWindowState.MinimizedToTray;
+        }
+
+        if (window.IsMinimized)
+        {
+            return SavedWindowState.MinimizedToTaskbar;
+        }
+
+        return window.IsMaximized ? SavedWindowState.Maximized : SavedWindowState.Normal;
+    }
+
     public MonitorInfo? FindContainingMonitor(WindowInfo window, IReadOnlyList<MonitorInfo> monitors)
     {
         var screen = Forms.Screen.FromHandle(window.Handle);
@@ -221,6 +254,26 @@ public sealed class NativeWindowService
         return moved;
     }
 
+    private static void TriggerTrayAction(nint hwnd, MinimizeToTrayAction action)
+    {
+        var command = action == MinimizeToTrayAction.CloseButton
+            ? SystemCommand.Close
+            : SystemCommand.Minimize;
+        PostMessage(hwnd, WindowMessage.SystemCommand, (nint)command, nint.Zero);
+    }
+
+    private static bool TryGetUsefulWindowRect(nint hwnd, bool isMinimized, out NativeRect rect)
+    {
+        var placement = new WindowPlacement { Length = Marshal.SizeOf<WindowPlacement>() };
+        if (isMinimized && GetWindowPlacement(hwnd, ref placement))
+        {
+            rect = placement.NormalPosition;
+            return true;
+        }
+
+        return GetWindowRect(hwnd, out rect);
+    }
+
     private static string NormalizeProcessName(string processName)
     {
         return Path.GetFileNameWithoutExtension(processName.Trim());
@@ -241,6 +294,9 @@ public sealed class NativeWindowService
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(nint hwnd);
 
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(nint hwnd);
+
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(nint hwnd, StringBuilder lpString, int nMaxCount);
 
@@ -256,8 +312,14 @@ public sealed class NativeWindowService
     [DllImport("user32.dll")]
     private static extern bool IsZoomed(nint hwnd);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetWindowPlacement(nint hwnd, ref WindowPlacement placement);
+
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(nint hwnd, ShowWindowCommand command);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(nint hwnd, WindowMessage message, nint wParam, nint lParam);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetWindowPos(
@@ -280,8 +342,21 @@ public sealed class NativeWindowService
 
     private enum ShowWindowCommand
     {
+        Hide = 0,
+        Minimize = 6,
         Restore = 9,
         Maximize = 3
+    }
+
+    private enum WindowMessage
+    {
+        SystemCommand = 0x0112
+    }
+
+    private enum SystemCommand
+    {
+        Minimize = 0xF020,
+        Close = 0xF060
     }
 
     [Flags]
@@ -303,5 +378,23 @@ public sealed class NativeWindowService
         public int Bottom { get; }
         public int Width => Right - Left;
         public int Height => Bottom - Top;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowPlacement
+    {
+        public int Length;
+        public int Flags;
+        public int ShowCommand;
+        public NativePoint MinPosition;
+        public NativePoint MaxPosition;
+        public NativeRect NormalPosition;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct NativePoint
+    {
+        public int X { get; }
+        public int Y { get; }
     }
 }

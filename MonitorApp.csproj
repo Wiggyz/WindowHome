@@ -19,6 +19,8 @@
     <Compile Remove="github-upload\**\*.cs" />
     <Page Remove="github-upload\**\*.xaml" />
     <None Remove="github-upload\**\*" />
+    <Compile Remove="WindowHome.Tests\**\*.cs" />
+    <None Remove="WindowHome.Tests\**\*" />
   </ItemGroup>
 
   <ItemGroup>
