@@ -225,6 +225,7 @@ public partial class MainWindow : Window
 
     private void ApplySavedRules()
     {
+        ReleaseStartupSuppressionsForStoppedApps();
         var monitorSignature = string.Join("|", _monitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
         var latestMonitors = _windowService.GetMonitors().ToList();
         var latestSignature = string.Join("|", latestMonitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
@@ -257,6 +258,19 @@ public partial class MainWindow : Window
                 _appliedWindows.Add(assignment.Window.Handle);
                 SetStatus($"Moved {assignment.Window.ProcessName} to {monitor.DisplayName}");
             }
+        }
+    }
+
+    private void ReleaseStartupSuppressionsForStoppedApps()
+    {
+        if (_startupSuppressedRuleIds.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var ruleId in RuleAutomation.GetStoppedSuppressedRuleIds(_settings, GetRunningProcesses(), _startupSuppressedRuleIds))
+        {
+            _startupSuppressedRuleIds.Remove(ruleId);
         }
     }
 

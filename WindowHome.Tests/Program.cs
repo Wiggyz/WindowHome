@@ -76,6 +76,16 @@ var runningRuleIds = RuleAutomation.GetAlreadyRunningRuleIds(
     new AppSettings { Rules = [autoRule] },
     [new RunningProcessInfo("APP", "")]);
 TestAssert.True(runningRuleIds.Contains(autoRule.Id), "Already-running saved apps should be suppressible by rule id during startup.");
+var stoppedRuleIds = RuleAutomation.GetStoppedSuppressedRuleIds(
+    new AppSettings { Rules = [autoRule] },
+    [],
+    [autoRule.Id]);
+TestAssert.True(stoppedRuleIds.Contains(autoRule.Id), "Suppressed saved apps should be released after the app process exits.");
+stoppedRuleIds = RuleAutomation.GetStoppedSuppressedRuleIds(
+    new AppSettings { Rules = [autoRule] },
+    [new RunningProcessInfo("APP", "")],
+    [autoRule.Id]);
+TestAssert.True(stoppedRuleIds.Count == 0, "Suppressed saved apps should stay suppressed while the original app process is still running.");
 
 var pathOnlyRunningRuleIds = RuleAutomation.GetAlreadyRunningRuleIds(
     new AppSettings
