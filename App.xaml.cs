@@ -1,5 +1,6 @@
-﻿using System.Configuration;
+using System.Configuration;
 using System.Data;
+using System.Threading;
 using System.Windows;
 
 namespace MonitorApp;
@@ -9,8 +10,19 @@ namespace MonitorApp;
 /// </summary>
 public partial class App : System.Windows.Application
 {
+    private Mutex? _singleInstanceMutex;
+    private bool _ownsSingleInstanceMutex;
+
     protected override void OnStartup(System.Windows.StartupEventArgs e)
     {
+        _singleInstanceMutex = new Mutex(true, @"Local\WindowHome.SingleInstance", out var createdNew);
+        if (!createdNew)
+        {
+            Shutdown();
+            return;
+        }
+
+        _ownsSingleInstanceMutex = true;
         base.OnStartup(e);
         DispatcherUnhandledException += (_, args) =>
         {
@@ -23,5 +35,15 @@ public partial class App : System.Windows.Application
             args.Handled = true;
         };
     }
-}
 
+    protected override void OnExit(ExitEventArgs e)
+    {
+        if (_ownsSingleInstanceMutex)
+        {
+            _singleInstanceMutex?.ReleaseMutex();
+        }
+
+        _singleInstanceMutex?.Dispose();
+        base.OnExit(e);
+    }
+}

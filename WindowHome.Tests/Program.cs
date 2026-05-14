@@ -189,6 +189,8 @@ TestAssert.True(SoundControlAutomation.GetMatchingRules(
     [new RunningProcessInfo("spotify", "")]).Count() == 1,
     "Only running sound apps should be returned as active matches.");
 TestAssert.True(soundSettings.MuteHotkey.DisplayText == "Mouse XButton1", "Hotkey display text should keep the captured label.");
+TestAssert.True(SoundControlAutomation.HasAnyHotkey(soundSettings), "Sound control should detect configured global hotkeys.");
+TestAssert.True(!SoundControlAutomation.HasAnyHotkey(new SoundControlSettings()), "Sound control should skip global hooks when no hotkeys are configured.");
 
 var editorIdentity = new EditorIdentity("Custom Tool", "customtool", @"C:\Apps\CustomTool.exe");
 var selectedWindow = Window((nint)404, "explorer", @"C:\Windows\explorer.exe");

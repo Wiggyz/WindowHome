@@ -8,6 +8,9 @@ namespace MonitorApp;
 
 public sealed class NativeWindowService
 {
+    private static readonly TimeSpan ProcessInfoCacheDuration = TimeSpan.FromSeconds(6);
+    private readonly Dictionary<int, CachedProcessInfo> _processInfoCache = [];
+
     public IReadOnlyList<MonitorInfo> GetMonitors()
     {
         return Forms.Screen.AllScreens
@@ -80,22 +83,7 @@ public sealed class NativeWindowService
             return null;
         }
 
-        var processName = "";
-        var executablePath = "";
-        try
-        {
-            using var process = Process.GetProcessById((int)processId);
-            processName = process.ProcessName;
-            try
-            {
-                executablePath = process.MainModule?.FileName ?? "";
-            }
-            catch
-            {
-                executablePath = "";
-            }
-        }
-        catch
+        if (!TryGetCachedProcessInfo((int)processId, out var processInfo))
         {
             return null;
         }
@@ -104,8 +92,8 @@ public sealed class NativeWindowService
         {
             Handle = hwnd,
             ProcessId = (int)processId,
-            ProcessName = processName,
-            ExecutablePath = executablePath,
+            ProcessName = processInfo.ProcessName,
+            ExecutablePath = processInfo.ExecutablePath,
             Title = title,
             Rect = new WindowRect
             {
@@ -119,6 +107,39 @@ public sealed class NativeWindowService
             IsVisible = isVisible,
             IsHidden = !isVisible
         };
+    }
+
+    private bool TryGetCachedProcessInfo(int processId, out CachedProcessInfo processInfo)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_processInfoCache.TryGetValue(processId, out processInfo) && processInfo.ExpiresAt > now)
+        {
+            return true;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            var executablePath = "";
+            try
+            {
+                executablePath = process.MainModule?.FileName ?? "";
+            }
+            catch
+            {
+                executablePath = "";
+            }
+
+            processInfo = new CachedProcessInfo(process.ProcessName, executablePath, now + ProcessInfoCacheDuration);
+            _processInfoCache[processId] = processInfo;
+            return true;
+        }
+        catch
+        {
+            _processInfoCache.Remove(processId);
+            processInfo = default;
+            return false;
+        }
     }
 
     public bool ApplyRule(WindowInfo window, AppRule rule, MonitorInfo monitor)
@@ -397,4 +418,6 @@ public sealed class NativeWindowService
         public int X { get; }
         public int Y { get; }
     }
+
+    private readonly record struct CachedProcessInfo(string ProcessName, string ExecutablePath, DateTimeOffset ExpiresAt);
 }

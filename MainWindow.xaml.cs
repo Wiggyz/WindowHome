@@ -49,10 +49,15 @@ public partial class MainWindow : Window
     private Forms.NotifyIcon? _trayIcon;
     private readonly List<string> _iconFramePaths = [];
     private readonly List<System.Drawing.Icon> _trayAnimationIcons = [];
+    private readonly List<BitmapFrame> _windowAnimationFrames = [];
+    private IReadOnlyList<RunningProcessInfo> _runningProcessCache = [];
     private WinEventDelegate? _winEventDelegate;
     private nint _windowEventHook;
     private int _iconFrameIndex;
+    private DateTimeOffset _runningProcessCacheAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastApplySavedRulesAt = DateTimeOffset.MinValue;
     private bool _syncingStartupChecks;
+    private bool _applyingSavedRules;
     private SoundControlWindow? _soundControlWindow;
 
     public MainWindow()
@@ -65,13 +70,13 @@ public partial class MainWindow : Window
 
         _pollTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromSeconds(1)
+            Interval = TimeSpan.FromSeconds(5)
         };
         _pollTimer.Tick += (_, _) => OnPollTimerTick();
 
         _windowEventDebounceTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(450)
+            Interval = TimeSpan.FromMilliseconds(1500)
         };
         _windowEventDebounceTimer.Tick += (_, _) =>
         {
@@ -81,7 +86,7 @@ public partial class MainWindow : Window
 
         _iconAnimationTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(420)
+            Interval = TimeSpan.FromMilliseconds(900)
         };
         _iconAnimationTimer.Tick += (_, _) => AdvanceAnimatedIcon();
 
@@ -112,7 +117,7 @@ public partial class MainWindow : Window
         MarkAlreadyRunningSavedAppsForStartupSkip();
         StartWindowEventHooks();
         StartAutoStartRules();
-        _soundHotkeyService.Start();
+        UpdateSoundHotkeyService();
         _pollTimer.Start();
         _iconAnimationTimer.Start();
         SetStatus($"Rules stored: {_stateService.SettingsPath}");
@@ -231,39 +236,54 @@ public partial class MainWindow : Window
 
     private void ApplySavedRules()
     {
-        ReleaseStartupSuppressionsForStoppedApps();
-        var monitorSignature = string.Join("|", _monitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
-        var latestMonitors = _windowService.GetMonitors().ToList();
-        var latestSignature = string.Join("|", latestMonitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
-        if (!string.Equals(monitorSignature, latestSignature, StringComparison.Ordinal))
+        var now = DateTimeOffset.UtcNow;
+        if (_applyingSavedRules || now - _lastApplySavedRulesAt < TimeSpan.FromSeconds(2))
         {
-            _monitors = latestMonitors;
-            MonitorCountText.Text = $"{_monitors.Count} active monitor{(_monitors.Count == 1 ? "" : "s")} detected";
-            MonitorList.ItemsSource = _monitors;
-            MonitorCombo.ItemsSource = _monitors;
-            BindRules();
-            _appliedWindows.Clear();
+            return;
         }
 
-        var assignments = RuleAutomation.MatchRulesToWindows(
-            _settings.Rules.Where(rule => !_startupSuppressedRuleIds.Contains(rule.Id)),
-            _windowService.GetOpenWindows(),
-            (window, rule) => _windowService.Matches(window, rule),
-            _appliedWindows);
-
-        foreach (var assignment in assignments)
+        _applyingSavedRules = true;
+        _lastApplySavedRulesAt = now;
+        try
         {
-            var monitor = FindTargetMonitor(assignment.Rule);
-            if (monitor is null)
+            ReleaseStartupSuppressionsForStoppedApps();
+            var monitorSignature = string.Join("|", _monitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
+            var latestMonitors = _windowService.GetMonitors().ToList();
+            var latestSignature = string.Join("|", latestMonitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
+            if (!string.Equals(monitorSignature, latestSignature, StringComparison.Ordinal))
             {
-                continue;
+                _monitors = latestMonitors;
+                MonitorCountText.Text = $"{_monitors.Count} active monitor{(_monitors.Count == 1 ? "" : "s")} detected";
+                MonitorList.ItemsSource = _monitors;
+                MonitorCombo.ItemsSource = _monitors;
+                BindRules();
+                _appliedWindows.Clear();
             }
 
-            if (_windowService.ApplyRule(assignment.Window, assignment.Rule, monitor))
+            var assignments = RuleAutomation.MatchRulesToWindows(
+                _settings.Rules.Where(rule => !_startupSuppressedRuleIds.Contains(rule.Id)),
+                _windowService.GetOpenWindows(),
+                (window, rule) => _windowService.Matches(window, rule),
+                _appliedWindows);
+
+            foreach (var assignment in assignments)
             {
-                _appliedWindows.Add(assignment.Window.Handle);
-                SetStatus($"Moved {assignment.Window.ProcessName} to {monitor.DisplayName}");
+                var monitor = FindTargetMonitor(assignment.Rule);
+                if (monitor is null)
+                {
+                    continue;
+                }
+
+                if (_windowService.ApplyRule(assignment.Window, assignment.Rule, monitor))
+                {
+                    _appliedWindows.Add(assignment.Window.Handle);
+                    SetStatus($"Moved {assignment.Window.ProcessName} to {monitor.DisplayName}");
+                }
             }
+        }
+        finally
+        {
+            _applyingSavedRules = false;
         }
     }
 
@@ -819,8 +839,14 @@ public partial class MainWindow : Window
         }
     }
 
-    private static IReadOnlyList<RunningProcessInfo> GetRunningProcesses()
+    private IReadOnlyList<RunningProcessInfo> GetRunningProcesses()
     {
+        var now = DateTimeOffset.UtcNow;
+        if (now - _runningProcessCacheAt < TimeSpan.FromSeconds(6))
+        {
+            return _runningProcessCache;
+        }
+
         var processes = new List<RunningProcessInfo>();
         foreach (var process in Process.GetProcesses())
         {
@@ -847,7 +873,9 @@ public partial class MainWindow : Window
             }
         }
 
-        return processes;
+        _runningProcessCache = processes;
+        _runningProcessCacheAt = now;
+        return _runningProcessCache;
     }
 
     private bool StartAppForRule(AppRule rule)
@@ -994,6 +1022,7 @@ public partial class MainWindow : Window
             DrawWindowHomeIcon(path, i);
             _iconFramePaths.Add(path);
             _trayAnimationIcons.Add(new System.Drawing.Icon(path));
+            _windowAnimationFrames.Add(BitmapFrame.Create(new Uri(path, UriKind.Absolute)));
         }
     }
 
@@ -1005,13 +1034,15 @@ public partial class MainWindow : Window
         }
 
         _iconFrameIndex = (_iconFrameIndex + 1) % _iconFramePaths.Count;
-        var framePath = _iconFramePaths[_iconFrameIndex];
         if (_trayIcon is not null && _iconFrameIndex < _trayAnimationIcons.Count)
         {
             _trayIcon.Icon = _trayAnimationIcons[_iconFrameIndex];
         }
 
-        Icon = BitmapFrame.Create(new Uri(framePath, UriKind.Absolute));
+        if (_iconFrameIndex < _windowAnimationFrames.Count)
+        {
+            Icon = _windowAnimationFrames[_iconFrameIndex];
+        }
     }
 
     private static void DrawWindowHomeIcon(string path, int frame)
@@ -1183,6 +1214,7 @@ public partial class MainWindow : Window
     {
         UpdateRuleMonitorLabels();
         _stateService.Save(_settings);
+        UpdateSoundHotkeyService();
     }
 
     private EditorIdentity ReadRuleEditorIdentity()
@@ -1200,6 +1232,25 @@ public partial class MainWindow : Window
     private void SetStatus(string message)
     {
         StatusText.Text = message;
+    }
+
+    private void UpdateSoundHotkeyService()
+    {
+        try
+        {
+            if (SoundControlAutomation.HasAnyHotkey(_settings.SoundControl))
+            {
+                _soundHotkeyService.Start();
+            }
+            else
+            {
+                _soundHotkeyService.Stop();
+            }
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Sound hotkeys unavailable: {ex.Message}");
+        }
     }
 
     private void AnyButton_Click(object sender, RoutedEventArgs e)

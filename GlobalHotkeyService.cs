@@ -30,7 +30,7 @@ public sealed class GlobalHotkeyService : IDisposable
     private readonly Action<SoundHotkeyAction> _onTriggered;
     private readonly LowLevelProc _keyboardProc;
     private readonly LowLevelProc _mouseProc;
-    private readonly HashSet<string> _pressedInputs = [];
+    private readonly HashSet<PressedInput> _pressedInputs = [];
     private nint _keyboardHook;
     private nint _mouseHook;
 
@@ -49,9 +49,7 @@ public sealed class GlobalHotkeyService : IDisposable
             return;
         }
 
-        using var process = Process.GetCurrentProcess();
-        using var module = process.MainModule;
-        var moduleHandle = GetModuleHandle(module?.ModuleName);
+        var moduleHandle = GetModuleHandle(null);
         _keyboardHook = SetWindowsHookEx(WhKeyboardLl, _keyboardProc, moduleHandle, 0);
         _mouseHook = SetWindowsHookEx(WhMouseLl, _mouseProc, moduleHandle, 0);
         if (_keyboardHook == nint.Zero || _mouseHook == nint.Zero)
@@ -90,7 +88,7 @@ public sealed class GlobalHotkeyService : IDisposable
         {
             var message = unchecked((int)wParam);
             var keyInfo = Marshal.PtrToStructure<KbdLlHookStruct>(lParam);
-            var token = $"K:{keyInfo.VirtualKeyCode}";
+            var token = new PressedInput(HotkeyInputKind.Keyboard, (int)keyInfo.VirtualKeyCode);
             if (message is WmKeyDown or WmSysKeyDown)
             {
                 if (_pressedInputs.Add(token))
@@ -111,7 +109,7 @@ public sealed class GlobalHotkeyService : IDisposable
     {
         if (code >= 0 && TryGetMouseCode(unchecked((int)wParam), lParam, out var mouseCode, out var isDown))
         {
-            var token = $"M:{mouseCode}";
+            var token = new PressedInput(HotkeyInputKind.Mouse, mouseCode);
             if (isDown)
             {
                 if (_pressedInputs.Add(token))
@@ -130,14 +128,33 @@ public sealed class GlobalHotkeyService : IDisposable
 
     private void TriggerIfMatched(HotkeyBinding binding)
     {
-        var settings = _settingsAccessor();
-        foreach (var hotkey in SoundControlAutomation.EnumerateHotkeys(settings))
+        try
         {
-            if (SoundControlAutomation.BindingsEqual(hotkey.Binding, binding))
+            var settings = _settingsAccessor();
+            foreach (var hotkey in SoundControlAutomation.EnumerateHotkeys(settings))
             {
-                _onTriggered(hotkey.Action);
-                break;
+                if (SoundControlAutomation.BindingsEqual(hotkey.Binding, binding))
+                {
+                    var action = hotkey.Action;
+                    ThreadPool.QueueUserWorkItem(_ => SafeTrigger(action));
+                    break;
+                }
             }
+        }
+        catch
+        {
+            // Hook callbacks must stay fast and never break the input chain.
+        }
+    }
+
+    private void SafeTrigger(SoundHotkeyAction action)
+    {
+        try
+        {
+            _onTriggered(action);
+        }
+        catch
+        {
         }
     }
 
@@ -186,6 +203,8 @@ public sealed class GlobalHotkeyService : IDisposable
     }
 
     private delegate nint LowLevelProc(int code, nint wParam, nint lParam);
+
+    private readonly record struct PressedInput(HotkeyInputKind Kind, int Code);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern nint SetWindowsHookEx(int idHook, LowLevelProc lpfn, nint hMod, uint dwThreadId);

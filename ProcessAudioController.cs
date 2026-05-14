@@ -8,10 +8,16 @@ public sealed class ProcessAudioController
     private const float VolumeStep = 0.05f;
     private static readonly Guid ClsIdMmDeviceEnumerator = new("BCDE0395-E52F-467C-8E3D-C4579291692E");
     private static readonly Guid IidIAudioSessionManager2 = new("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
+    private readonly SemaphoreSlim _applyLock = new(1, 1);
 
     public void ApplyToMatchingSessions(SoundControlSettings settings, SoundHotkeyAction action)
     {
         if (settings.Rules.Count == 0)
+        {
+            return;
+        }
+
+        if (!_applyLock.Wait(0))
         {
             return;
         }
@@ -35,13 +41,11 @@ public sealed class ProcessAudioController
             for (var i = 0; i < count; i++)
             {
                 IAudioSessionControl? sessionControl = null;
-                IAudioSessionControl2? sessionControl2 = null;
-                ISimpleAudioVolume? simpleVolume = null;
                 try
                 {
                     Marshal.ThrowExceptionForHR(sessionEnumerator.GetSession(i, out sessionControl));
-                    sessionControl2 = (IAudioSessionControl2)sessionControl!;
-                    simpleVolume = (ISimpleAudioVolume)sessionControl!;
+                    var sessionControl2 = (IAudioSessionControl2)sessionControl!;
+                    var simpleVolume = (ISimpleAudioVolume)sessionControl!;
                     Marshal.ThrowExceptionForHR(sessionControl2.GetProcessId(out var processId));
                     if (processId == 0 || !TryGetProcess(processId, out var process))
                     {
@@ -60,8 +64,6 @@ public sealed class ProcessAudioController
                 }
                 finally
                 {
-                    ReleaseComObject(simpleVolume);
-                    ReleaseComObject(sessionControl2);
                     ReleaseComObject(sessionControl);
                 }
             }
@@ -72,10 +74,10 @@ public sealed class ProcessAudioController
         finally
         {
             ReleaseComObject(sessionEnumerator);
-            ReleaseComObject(sessionManager);
             ReleaseComObject(sessionManagerObject);
             ReleaseComObject(device);
             ReleaseComObject(deviceEnumerator);
+            _applyLock.Release();
         }
     }
 
@@ -194,7 +196,6 @@ public sealed class ProcessAudioController
         int NotImpl6();
         int NotImpl7();
         int NotImpl8();
-        int NotImpl9();
     }
 
     [ComImport]
@@ -211,7 +212,6 @@ public sealed class ProcessAudioController
         int NotImpl6();
         int NotImpl7();
         int NotImpl8();
-        int NotImpl9();
         int GetSessionIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string retVal);
         int GetSessionInstanceIdentifier([MarshalAs(UnmanagedType.LPWStr)] out string retVal);
         int GetProcessId(out int retv);

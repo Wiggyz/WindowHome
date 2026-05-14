@@ -349,6 +349,11 @@ public static class SoundControlAutomation
         yield return (SoundHotkeyAction.ToggleMute, settings.MuteHotkey);
     }
 
+    public static bool HasAnyHotkey(SoundControlSettings settings)
+    {
+        return EnumerateHotkeys(settings).Any(hotkey => hotkey.Binding.IsSet);
+    }
+
     public static bool BindingsEqual(HotkeyBinding left, HotkeyBinding right)
     {
         return left.IsSet
