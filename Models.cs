@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text.Json.Serialization;
 
 namespace MonitorApp;
@@ -6,6 +7,7 @@ public sealed class AppSettings
 {
     public bool MinimizeToTray { get; set; } = true;
     public List<AppRule> Rules { get; set; } = [];
+    public SoundControlSettings SoundControl { get; set; } = new();
 }
 
 public sealed class AppRule
@@ -137,6 +139,229 @@ public sealed class WindowInfo
 }
 
 public readonly record struct RuleWindowAssignment(AppRule Rule, WindowInfo Window);
+
+public sealed class SoundControlSettings
+{
+    public List<SoundAppRule> Rules { get; set; } = [];
+    public HotkeyBinding VolumeUpHotkey { get; set; } = new();
+    public HotkeyBinding VolumeDownHotkey { get; set; } = new();
+    public HotkeyBinding MuteHotkey { get; set; } = new();
+}
+
+public sealed class SoundAppRule
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public string DisplayName { get; set; } = "";
+    public string ExecutablePath { get; set; } = "";
+    public string ProcessName { get; set; } = "";
+
+    [JsonIgnore]
+    public string MatchLabel => string.IsNullOrWhiteSpace(ExecutablePath) ? ProcessName : ExecutablePath;
+}
+
+public sealed class HotkeyBinding
+{
+    public HotkeyInputKind Kind { get; set; } = HotkeyInputKind.None;
+    public int Code { get; set; }
+    public string DisplayText { get; set; } = "Click to set hotkey";
+
+    [JsonIgnore]
+    public bool IsSet => Kind != HotkeyInputKind.None && Code != 0;
+}
+
+public enum HotkeyInputKind
+{
+    None,
+    Keyboard,
+    Mouse
+}
+
+public enum SoundHotkeyAction
+{
+    VolumeUp,
+    VolumeDown,
+    ToggleMute
+}
+
+public readonly record struct EditorIdentity(string DisplayName, string ProcessName, string ExecutablePath)
+{
+    public bool HasIdentity =>
+        !string.IsNullOrWhiteSpace(DisplayName)
+        || !string.IsNullOrWhiteSpace(ProcessName)
+        || !string.IsNullOrWhiteSpace(ExecutablePath);
+}
+
+public static class EditorFieldAutomation
+{
+    public static EditorIdentity CreateIdentityFromExecutable(string executablePath)
+    {
+        var normalizedName = Path.GetFileNameWithoutExtension(executablePath?.Trim() ?? "");
+        return new EditorIdentity(normalizedName, normalizedName, executablePath?.Trim() ?? "");
+    }
+
+    public static EditorIdentity CreateIdentityFromWindow(WindowInfo window)
+    {
+        var processName = NormalizeProcessName(window.ProcessName);
+        return new EditorIdentity(processName, processName, window.ExecutablePath);
+    }
+
+    public static EditorIdentity ResolveIdentityForPositionSave(EditorIdentity editorIdentity, WindowInfo window)
+    {
+        return editorIdentity.HasIdentity ? Normalize(editorIdentity) : CreateIdentityFromWindow(window);
+    }
+
+    public static bool MatchesRule(AppRule rule, EditorIdentity identity)
+    {
+        var normalized = Normalize(identity);
+        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath) && !string.IsNullOrWhiteSpace(normalized.ExecutablePath))
+        {
+            return string.Equals(rule.ExecutablePath, normalized.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return !string.IsNullOrWhiteSpace(normalized.ProcessName)
+            && string.Equals(NormalizeProcessName(rule.ProcessName), normalized.ProcessName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool MatchesRule(SoundAppRule rule, EditorIdentity identity)
+    {
+        var normalized = Normalize(identity);
+        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath) && !string.IsNullOrWhiteSpace(normalized.ExecutablePath))
+        {
+            return string.Equals(rule.ExecutablePath, normalized.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return !string.IsNullOrWhiteSpace(normalized.ProcessName)
+            && string.Equals(NormalizeProcessName(rule.ProcessName), normalized.ProcessName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static EditorIdentity Normalize(EditorIdentity identity)
+    {
+        var executablePath = identity.ExecutablePath?.Trim() ?? "";
+        var processName = NormalizeProcessName(string.IsNullOrWhiteSpace(identity.ProcessName) ? executablePath : identity.ProcessName);
+        var displayName = string.IsNullOrWhiteSpace(identity.DisplayName)
+            ? processName
+            : identity.DisplayName.Trim();
+        return new EditorIdentity(displayName, processName, executablePath);
+    }
+
+    private static string NormalizeProcessName(string value)
+    {
+        return Path.GetFileNameWithoutExtension(value?.Trim() ?? "");
+    }
+}
+
+public static class SaveAutomation
+{
+    public static bool ShouldHideOnLaunch(bool minimizeToTrayOnLaunch)
+    {
+        return minimizeToTrayOnLaunch;
+    }
+
+    public static AppRule CreateManualRule(EditorIdentity identity, MonitorInfo monitor)
+    {
+        return new AppRule
+        {
+            DisplayName = string.IsNullOrWhiteSpace(identity.DisplayName)
+                ? Path.GetFileNameWithoutExtension(identity.ExecutablePath.Length > 0 ? identity.ExecutablePath : identity.ProcessName)
+                : identity.DisplayName.Trim(),
+            ExecutablePath = identity.ExecutablePath.Trim(),
+            ProcessName = string.IsNullOrWhiteSpace(identity.ProcessName)
+                ? Path.GetFileNameWithoutExtension(identity.ExecutablePath)
+                : Path.GetFileNameWithoutExtension(identity.ProcessName),
+            TargetMonitorDeviceName = monitor.DeviceName,
+            TargetMonitorLabel = monitor.DisplayName,
+            Enabled = true
+        };
+    }
+
+    public static SoundAppRule CreateManualSoundRule(EditorIdentity identity)
+    {
+        return new SoundAppRule
+        {
+            DisplayName = string.IsNullOrWhiteSpace(identity.DisplayName)
+                ? Path.GetFileNameWithoutExtension(identity.ExecutablePath.Length > 0 ? identity.ExecutablePath : identity.ProcessName)
+                : identity.DisplayName.Trim(),
+            ExecutablePath = identity.ExecutablePath.Trim(),
+            ProcessName = SoundControlAutomation.NormalizeProcessName(string.IsNullOrWhiteSpace(identity.ProcessName) ? identity.ExecutablePath : identity.ProcessName)
+        };
+    }
+}
+
+public static class SoundControlAutomation
+{
+    public static bool MatchesProcess(SoundAppRule rule, RunningProcessInfo process)
+    {
+        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath) && !string.IsNullOrWhiteSpace(process.ExecutablePath))
+        {
+            return string.Equals(rule.ExecutablePath, process.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        var ruleProcessName = NormalizeProcessName(rule.ProcessName);
+        if (string.IsNullOrWhiteSpace(ruleProcessName) && !string.IsNullOrWhiteSpace(rule.ExecutablePath))
+        {
+            ruleProcessName = Path.GetFileNameWithoutExtension(rule.ExecutablePath);
+        }
+
+        var processName = NormalizeProcessName(process.ProcessName);
+        if (string.IsNullOrWhiteSpace(processName) && !string.IsNullOrWhiteSpace(process.ExecutablePath))
+        {
+            processName = Path.GetFileNameWithoutExtension(process.ExecutablePath);
+        }
+
+        return !string.IsNullOrWhiteSpace(ruleProcessName)
+            && string.Equals(ruleProcessName, processName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool HasHotkeyConflict(SoundControlSettings settings, SoundHotkeyAction action, HotkeyBinding candidate)
+    {
+        if (!candidate.IsSet)
+        {
+            return false;
+        }
+
+        foreach (var existing in EnumerateHotkeys(settings))
+        {
+            if (existing.Action == action)
+            {
+                continue;
+            }
+
+            if (BindingsEqual(existing.Binding, candidate))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static IEnumerable<SoundAppRule> GetMatchingRules(
+        SoundControlSettings settings,
+        IEnumerable<RunningProcessInfo> processes)
+    {
+        return settings.Rules.Where(rule => processes.Any(process => MatchesProcess(rule, process)));
+    }
+
+    public static IEnumerable<(SoundHotkeyAction Action, HotkeyBinding Binding)> EnumerateHotkeys(SoundControlSettings settings)
+    {
+        yield return (SoundHotkeyAction.VolumeUp, settings.VolumeUpHotkey);
+        yield return (SoundHotkeyAction.VolumeDown, settings.VolumeDownHotkey);
+        yield return (SoundHotkeyAction.ToggleMute, settings.MuteHotkey);
+    }
+
+    public static bool BindingsEqual(HotkeyBinding left, HotkeyBinding right)
+    {
+        return left.IsSet
+            && right.IsSet
+            && left.Kind == right.Kind
+            && left.Code == right.Code;
+    }
+
+    public static string NormalizeProcessName(string value)
+    {
+        return Path.GetFileNameWithoutExtension(value?.Trim() ?? "");
+    }
+}
 
 public sealed class WindowRect
 {

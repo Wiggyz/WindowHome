@@ -34,6 +34,19 @@ public static class RuleAutomation
             .ToHashSet();
     }
 
+    public static IReadOnlySet<Guid> GetStoppedSuppressedRuleIds(
+        AppSettings settings,
+        IEnumerable<RunningProcessInfo> runningProcesses,
+        IEnumerable<Guid> suppressedRuleIds)
+    {
+        var running = runningProcesses.ToList();
+        var suppressed = suppressedRuleIds.ToHashSet();
+        return settings.Rules
+            .Where(rule => suppressed.Contains(rule.Id) && !IsAlreadyRunning(rule, running))
+            .Select(rule => rule.Id)
+            .ToHashSet();
+    }
+
     public static bool IsAlreadyRunning(AppRule rule, IEnumerable<RunningProcessInfo> runningProcesses)
     {
         var processNames = new[]

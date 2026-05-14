@@ -26,6 +26,7 @@
   <ItemGroup>
     <None Update="Assets\WindowHome.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </None>
   </ItemGroup>
 

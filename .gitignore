@@ -6,3 +6,5 @@ obj/
 published app/
 published app single/
 github-upload/
+HANDOFF.md
+*.log

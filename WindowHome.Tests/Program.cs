@@ -76,6 +76,16 @@ var runningRuleIds = RuleAutomation.GetAlreadyRunningRuleIds(
     new AppSettings { Rules = [autoRule] },
     [new RunningProcessInfo("APP", "")]);
 TestAssert.True(runningRuleIds.Contains(autoRule.Id), "Already-running saved apps should be suppressible by rule id during startup.");
+var stoppedRuleIds = RuleAutomation.GetStoppedSuppressedRuleIds(
+    new AppSettings { Rules = [autoRule] },
+    [],
+    [autoRule.Id]);
+TestAssert.True(stoppedRuleIds.Contains(autoRule.Id), "Suppressed saved apps should be released after the app process exits.");
+stoppedRuleIds = RuleAutomation.GetStoppedSuppressedRuleIds(
+    new AppSettings { Rules = [autoRule] },
+    [new RunningProcessInfo("APP", "")],
+    [autoRule.Id]);
+TestAssert.True(stoppedRuleIds.Count == 0, "Suppressed saved apps should stay suppressed while the original app process is still running.");
 
 var pathOnlyRunningRuleIds = RuleAutomation.GetAlreadyRunningRuleIds(
     new AppSettings
@@ -143,6 +153,85 @@ TestAssert.True(createTaskArgs.Contains("/RL HIGHEST", StringComparison.OrdinalI
 TestAssert.True(createTaskArgs.Contains("/IT", StringComparison.OrdinalIgnoreCase), "Elevated startup task should run interactively so tray icon can appear.");
 TestAssert.True(createTaskArgs.Contains("--minimized-to-tray", StringComparison.OrdinalIgnoreCase), "Elevated startup task should preserve minimized-to-tray startup.");
 TestAssert.True(ElevatedStartupTask.BuildDeleteArguments().Contains(ElevatedStartupTask.TaskName, StringComparison.Ordinal), "Elevated startup delete command should target WindowHome task.");
+
+var soundSettings = new SoundControlSettings
+{
+    VolumeUpHotkey = new HotkeyBinding { Kind = HotkeyInputKind.Keyboard, Code = 120, DisplayText = "F9" },
+    VolumeDownHotkey = new HotkeyBinding { Kind = HotkeyInputKind.Keyboard, Code = 121, DisplayText = "F10" },
+    MuteHotkey = new HotkeyBinding { Kind = HotkeyInputKind.Mouse, Code = 2, DisplayText = "Mouse XButton1" },
+    Rules =
+    [
+        new SoundAppRule { DisplayName = "Discord", ExecutablePath = @"C:\Apps\Discord\Discord.exe" },
+        new SoundAppRule { DisplayName = "Spotify", ProcessName = "Spotify.exe" }
+    ]
+};
+
+TestAssert.True(!SoundControlAutomation.HasHotkeyConflict(
+    soundSettings,
+    SoundHotkeyAction.VolumeUp,
+    new HotkeyBinding { Kind = HotkeyInputKind.Keyboard, Code = 120, DisplayText = "F9" }),
+    "Editing an action should not conflict with its own current binding.");
+TestAssert.True(SoundControlAutomation.HasHotkeyConflict(
+    soundSettings,
+    SoundHotkeyAction.VolumeDown,
+    new HotkeyBinding { Kind = HotkeyInputKind.Mouse, Code = 2, DisplayText = "Mouse XButton1" }),
+    "Different sound actions should reject duplicate bindings.");
+TestAssert.True(SoundControlAutomation.MatchesProcess(
+    soundSettings.Rules[0],
+    new RunningProcessInfo("discord", @"C:\Apps\Discord\Discord.exe")),
+    "Sound app matching should prefer exact executable path.");
+TestAssert.True(SoundControlAutomation.MatchesProcess(
+    soundSettings.Rules[1],
+    new RunningProcessInfo("Spotify", "")),
+    "Sound app matching should fall back to normalized process names.");
+TestAssert.True(SoundControlAutomation.GetMatchingRules(
+    soundSettings,
+    [new RunningProcessInfo("spotify", "")]).Count() == 1,
+    "Only running sound apps should be returned as active matches.");
+TestAssert.True(soundSettings.MuteHotkey.DisplayText == "Mouse XButton1", "Hotkey display text should keep the captured label.");
+
+var editorIdentity = new EditorIdentity("Custom Tool", "customtool", @"C:\Apps\CustomTool.exe");
+var selectedWindow = Window((nint)404, "explorer", @"C:\Windows\explorer.exe");
+var resolvedIdentity = EditorFieldAutomation.ResolveIdentityForPositionSave(editorIdentity, selectedWindow);
+TestAssert.True(resolvedIdentity.DisplayName == "Custom Tool", "Save current position should keep the rule editor name when the editor already defines the app.");
+TestAssert.True(resolvedIdentity.ProcessName == "customtool", "Save current position should keep the rule editor process when the editor already defines the app.");
+TestAssert.True(resolvedIdentity.ExecutablePath == @"C:\Apps\CustomTool.exe", "Save current position should keep the rule editor executable when the editor already defines the app.");
+
+var fallbackIdentity = EditorFieldAutomation.ResolveIdentityForPositionSave(new EditorIdentity("", "", ""), selectedWindow);
+TestAssert.True(fallbackIdentity.ProcessName == "explorer", "Blank rule editor should fall back to the selected current window process.");
+TestAssert.True(fallbackIdentity.ExecutablePath == @"C:\Windows\explorer.exe", "Blank rule editor should fall back to the selected current window executable.");
+
+var exeIdentity = EditorFieldAutomation.CreateIdentityFromExecutable(@"D:\Games\Steam\steam.exe");
+TestAssert.True(exeIdentity.DisplayName == "steam", "Choosing a new executable should replace the editor name with the executable name.");
+TestAssert.True(exeIdentity.ProcessName == "steam", "Choosing a new executable should replace the editor process with the executable name.");
+
+var appRule = new AppRule { DisplayName = "Steam", ProcessName = "steam", ExecutablePath = @"D:\Games\Steam\steam.exe" };
+var soundRule = new SoundAppRule { DisplayName = "Steam", ProcessName = "steam", ExecutablePath = @"D:\Games\Steam\steam.exe" };
+TestAssert.True(EditorFieldAutomation.MatchesRule(appRule, exeIdentity), "Rule editor overwrite detection should match the editor executable identity.");
+TestAssert.True(EditorFieldAutomation.MatchesRule(soundRule, exeIdentity), "Sound control overwrite detection should match the editor executable identity.");
+
+var primaryMonitor = new MonitorInfo
+{
+    DeviceName = @"\\.\DISPLAY1",
+    DisplayName = "Primary",
+    Bounds = new ScreenRect { Left = 0, Top = 0, Width = 1920, Height = 1080 },
+    WorkArea = new ScreenRect { Left = 0, Top = 0, Width = 1920, Height = 1040 },
+    IsPrimary = true
+};
+var existingManualRule = new AppRule { DisplayName = "Old", ProcessName = "old", ExecutablePath = @"C:\Apps\old.exe" };
+var newManualRule = SaveAutomation.CreateManualRule(
+    new EditorIdentity("New", "newapp", @"C:\Apps\newapp.exe"),
+    primaryMonitor);
+TestAssert.True(newManualRule.Id != existingManualRule.Id, "Save Rule should create a new saved app instead of overwriting the selected one.");
+TestAssert.True(newManualRule.DisplayName == "New", "Save Rule should use the current editor identity for the new rule.");
+
+var existingSoundRule = new SoundAppRule { DisplayName = "Old Sound", ProcessName = "oldsound", ExecutablePath = @"C:\Apps\oldsound.exe" };
+var newSoundRule = SaveAutomation.CreateManualSoundRule(new EditorIdentity("New Sound", "newsound", @"C:\Apps\newsound.exe"));
+TestAssert.True(newSoundRule.Id != existingSoundRule.Id, "Save Sound App should create a new saved app instead of overwriting the selected one.");
+TestAssert.True(newSoundRule.DisplayName == "New Sound", "Save Sound App should use the current editor identity for the new rule.");
+
+TestAssert.True(SaveAutomation.ShouldHideOnLaunch(true), "Checked tray-on-launch should hide WindowHome on startup.");
+TestAssert.True(!SaveAutomation.ShouldHideOnLaunch(false), "Unchecked tray-on-launch should not hide WindowHome on startup.");
 
 Console.WriteLine("WindowHome.Tests passed.");
 

@@ -38,6 +38,8 @@ public partial class MainWindow : Window
     private readonly HashSet<nint> _appliedWindows = [];
     private readonly HashSet<Guid> _startupSuppressedRuleIds = [];
     private readonly SoundPlayer _clickSoundPlayer = CreateClickSoundPlayer();
+    private readonly ProcessAudioController _processAudioController = new();
+    private readonly GlobalHotkeyService _soundHotkeyService;
 
     private AppSettings _settings = new();
     private List<MonitorInfo> _monitors = [];
@@ -50,13 +52,16 @@ public partial class MainWindow : Window
     private WinEventDelegate? _winEventDelegate;
     private nint _windowEventHook;
     private int _iconFrameIndex;
-    private bool _exitRequested;
     private bool _syncingStartupChecks;
+    private SoundControlWindow? _soundControlWindow;
 
     public MainWindow()
     {
         InitializeComponent();
         AddHandler(System.Windows.Controls.Primitives.ButtonBase.ClickEvent, new RoutedEventHandler(AnyButton_Click), true);
+        _soundHotkeyService = new GlobalHotkeyService(
+            () => _settings.SoundControl,
+            action => _processAudioController.ApplyToMatchingSessions(_settings.SoundControl, action));
 
         _pollTimer = new DispatcherTimer
         {
@@ -107,10 +112,11 @@ public partial class MainWindow : Window
         MarkAlreadyRunningSavedAppsForStartupSkip();
         StartWindowEventHooks();
         StartAutoStartRules();
+        _soundHotkeyService.Start();
         _pollTimer.Start();
         _iconAnimationTimer.Start();
         SetStatus($"Rules stored: {_stateService.SettingsPath}");
-        if (_settings.MinimizeToTray && ShouldStartMinimizedToTray())
+        if (SaveAutomation.ShouldHideOnLaunch(_settings.MinimizeToTray))
         {
             Dispatcher.BeginInvoke(HideToTray);
         }
@@ -225,6 +231,7 @@ public partial class MainWindow : Window
 
     private void ApplySavedRules()
     {
+        ReleaseStartupSuppressionsForStoppedApps();
         var monitorSignature = string.Join("|", _monitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
         var latestMonitors = _windowService.GetMonitors().ToList();
         var latestSignature = string.Join("|", latestMonitors.Select(monitor => $"{monitor.DeviceName}:{monitor.Bounds.Left}:{monitor.Bounds.Top}:{monitor.Bounds.Width}:{monitor.Bounds.Height}"));
@@ -260,6 +267,19 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ReleaseStartupSuppressionsForStoppedApps()
+    {
+        if (_startupSuppressedRuleIds.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var ruleId in RuleAutomation.GetStoppedSuppressedRuleIds(_settings, GetRunningProcesses(), _startupSuppressedRuleIds))
+        {
+            _startupSuppressedRuleIds.Remove(ruleId);
+        }
+    }
+
     private void MarkAlreadyRunningSavedAppsForStartupSkip()
     {
         foreach (var ruleId in RuleAutomation.GetAlreadyRunningRuleIds(_settings, GetRunningProcesses()))
@@ -289,7 +309,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            var rule = SaveRuleFromEditor();
+            var rule = SaveRuleFromEditor(appendOnly: true);
             if (rule is not null)
             {
                 SetStatus($"Saved {rule.DisplayName}.");
@@ -301,7 +321,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private AppRule? SaveRuleFromEditor()
+    private AppRule? SaveRuleFromEditor(bool appendOnly)
     {
         if (MonitorCombo.SelectedItem is not MonitorInfo monitor)
         {
@@ -317,14 +337,21 @@ public partial class MainWindow : Window
             return null;
         }
 
-        var rule = _selectedRule ?? new AppRule();
-        rule.DisplayName = string.IsNullOrWhiteSpace(NameBox.Text)
-            ? Path.GetFileNameWithoutExtension(exePath.Length > 0 ? exePath : processName)
-            : NameBox.Text.Trim();
-        rule.ExecutablePath = exePath;
-        rule.ProcessName = string.IsNullOrWhiteSpace(processName)
-            ? Path.GetFileNameWithoutExtension(exePath)
-            : Path.GetFileNameWithoutExtension(processName);
+        var rule = appendOnly || _selectedRule is null
+            ? SaveAutomation.CreateManualRule(ReadRuleEditorIdentity(), monitor)
+            : _selectedRule;
+
+        if (!appendOnly && _selectedRule is not null)
+        {
+            rule.DisplayName = string.IsNullOrWhiteSpace(NameBox.Text)
+                ? Path.GetFileNameWithoutExtension(exePath.Length > 0 ? exePath : processName)
+                : NameBox.Text.Trim();
+            rule.ExecutablePath = exePath;
+            rule.ProcessName = string.IsNullOrWhiteSpace(processName)
+                ? Path.GetFileNameWithoutExtension(exePath)
+                : Path.GetFileNameWithoutExtension(processName);
+        }
+
         rule.TargetMonitorDeviceName = monitor.DeviceName;
         rule.TargetMonitorLabel = monitor.DisplayName;
         rule.WindowState = ReadEditorWindowState();
@@ -345,11 +372,12 @@ public partial class MainWindow : Window
             };
         }
 
-        if (_selectedRule is null)
+        if (appendOnly || _selectedRule is null)
         {
             _settings.Rules.Add(rule);
-            _selectedRule = rule;
         }
+
+        _selectedRule = rule;
 
         SaveSettings();
         BindRules();
@@ -439,12 +467,7 @@ public partial class MainWindow : Window
 
         if (dialog.ShowDialog(this) == true)
         {
-            ExePathBox.Text = dialog.FileName;
-            ProcessNameBox.Text = Path.GetFileNameWithoutExtension(dialog.FileName);
-            if (string.IsNullOrWhiteSpace(NameBox.Text))
-            {
-                NameBox.Text = Path.GetFileNameWithoutExtension(dialog.FileName);
-            }
+            ApplyRuleEditorIdentity(EditorFieldAutomation.CreateIdentityFromExecutable(dialog.FileName));
         }
     }
 
@@ -456,9 +479,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        NameBox.Text = window.ProcessName;
-        ProcessNameBox.Text = window.ProcessName;
-        ExePathBox.Text = window.ExecutablePath;
+        ApplyRuleEditorIdentity(EditorFieldAutomation.CreateIdentityFromWindow(window));
         SetStatus($"Using {window.ProcessName}.");
     }
 
@@ -511,14 +532,11 @@ public partial class MainWindow : Window
             }
 
             var position = _windowService.CapturePosition(window, monitor);
-            var existingRule = _selectedRule is not null && ShouldOverwriteSelectedRuleWithWindow(_selectedRule, window)
-                ? _selectedRule
-                : null;
+            var editorIdentity = ReadRuleEditorIdentity();
+            var existingRule = FindRuleForEditorIdentity(editorIdentity);
             SelectRuleForOverwrite(existingRule);
 
-            NameBox.Text = window.ProcessName;
-            ProcessNameBox.Text = window.ProcessName;
-            ExePathBox.Text = window.ExecutablePath;
+            ApplyRuleEditorIdentity(EditorFieldAutomation.ResolveIdentityForPositionSave(editorIdentity, window));
             MonitorCombo.SelectedItem = monitor;
             var state = _windowService.CaptureWindowState(window);
             SetModeFromWindowState(state);
@@ -527,7 +545,7 @@ public partial class MainWindow : Window
             WidthBox.Text = position.Width.ToString();
             HeightBox.Text = position.Height.ToString();
 
-            var savedRule = SaveRuleFromEditor();
+            var savedRule = SaveRuleFromEditor(appendOnly: false);
             if (savedRule is not null)
             {
                 _appliedWindows.Add(window.Handle);
@@ -567,6 +585,21 @@ public partial class MainWindow : Window
         {
             RulesList.SelectedItem = rule;
         }
+    }
+
+    private AppRule? FindRuleForEditorIdentity(EditorIdentity identity)
+    {
+        if (!identity.HasIdentity)
+        {
+            return _selectedRule;
+        }
+
+        if (_selectedRule is not null && EditorFieldAutomation.MatchesRule(_selectedRule, identity))
+        {
+            return _selectedRule;
+        }
+
+        return _settings.Rules.FirstOrDefault(rule => EditorFieldAutomation.MatchesRule(rule, identity));
     }
 
     private static bool ShouldOverwriteSelectedRuleWithWindow(AppRule rule, WindowInfo window)
@@ -735,6 +768,26 @@ public partial class MainWindow : Window
         HideToTray();
     }
 
+    private void SoundControlButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_soundControlWindow is not null)
+        {
+            _soundControlWindow.Activate();
+            return;
+        }
+
+        _soundControlWindow = new SoundControlWindow(
+            _settings,
+            _windowService,
+            SaveSettings,
+            () => _clickSoundPlayer.Play())
+        {
+            Owner = this
+        };
+        _soundControlWindow.Closed += (_, _) => _soundControlWindow = null;
+        _soundControlWindow.Show();
+    }
+
     private void StartAutoStartRules()
     {
         var runningProcesses = GetRunningProcesses();
@@ -834,23 +887,14 @@ public partial class MainWindow : Window
 
     private void MainWindow_Closing(object? sender, CancelEventArgs e)
     {
-        if (_exitRequested)
+        StopWindowEventHooks();
+        _pollTimer.Stop();
+        _iconAnimationTimer.Stop();
+        _soundHotkeyService.Dispose();
+        _trayIcon?.Dispose();
+        foreach (var icon in _trayAnimationIcons)
         {
-            StopWindowEventHooks();
-            _pollTimer.Stop();
-            _iconAnimationTimer.Stop();
-            _trayIcon?.Dispose();
-            foreach (var icon in _trayAnimationIcons)
-            {
-                icon.Dispose();
-            }
-            return;
-        }
-
-        if (MinimizeToTrayCheck.IsChecked == true)
-        {
-            e.Cancel = true;
-            HideToTray();
+            icon.Dispose();
         }
     }
 
@@ -925,7 +969,6 @@ public partial class MainWindow : Window
         _trayIcon.ContextMenuStrip.Items.Add("Show", null, (_, _) => ShowFromTray());
         _trayIcon.ContextMenuStrip.Items.Add("Exit", null, (_, _) =>
         {
-            _exitRequested = true;
             _trayIcon.Visible = false;
             Close();
         });
@@ -1071,7 +1114,7 @@ public partial class MainWindow : Window
 
         ShowInTaskbar = false;
         Hide();
-        _trayIcon?.ShowBalloonTip(1000, AppName, "Still watching app windows.", Forms.ToolTipIcon.Info);
+        _trayIcon?.ShowBalloonTip(1000, AppName, "Still running in the notification area.", Forms.ToolTipIcon.Info);
     }
 
     private void RestoreTrayIconAfterTaskbarRestart()
@@ -1124,9 +1167,7 @@ public partial class MainWindow : Window
     private void ClearEditor()
     {
         _selectedRule = null;
-        NameBox.Text = "";
-        ExePathBox.Text = "";
-        ProcessNameBox.Text = "";
+        ApplyRuleEditorIdentity(new EditorIdentity("", "", ""));
         ModeCombo.SelectedIndex = 0;
         TrayActionCombo.SelectedIndex = 0;
         RuleAutoStartCheck.IsChecked = false;
@@ -1142,6 +1183,18 @@ public partial class MainWindow : Window
     {
         UpdateRuleMonitorLabels();
         _stateService.Save(_settings);
+    }
+
+    private EditorIdentity ReadRuleEditorIdentity()
+    {
+        return new EditorIdentity(NameBox.Text.Trim(), ProcessNameBox.Text.Trim(), ExePathBox.Text.Trim());
+    }
+
+    private void ApplyRuleEditorIdentity(EditorIdentity identity)
+    {
+        NameBox.Text = identity.DisplayName;
+        ProcessNameBox.Text = identity.ProcessName;
+        ExePathBox.Text = identity.ExecutablePath;
     }
 
     private void SetStatus(string message)
@@ -1305,12 +1358,6 @@ public partial class MainWindow : Window
         return !string.IsNullOrWhiteSpace(value)
             && !string.IsNullOrWhiteSpace(currentPath)
             && value.Contains(currentPath, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool ShouldStartMinimizedToTray()
-    {
-        return Environment.GetCommandLineArgs()
-            .Any(argument => string.Equals(argument, MinimizedToTrayArgument, StringComparison.OrdinalIgnoreCase));
     }
 
     private static void SetAutoStart(bool enabled, bool startMinimizedToTray)
