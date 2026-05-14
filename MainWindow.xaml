@@ -199,9 +199,9 @@
                           Checked="ElevatedStartupCheck_Changed"
                           Unchecked="ElevatedStartupCheck_Changed"/>
                 <CheckBox x:Name="MinimizeToTrayCheck"
-                          Content="Minimize to tray"
+                          Content="Start minimized to tray"
                           Margin="0,0,14,0"
-                          ToolTip="When checked, pressing the close button minimizes WindowHome to the notification area instead of closing it. The minimize button always minimizes WindowHome to the notification area."
+                          ToolTip="When checked, WindowHome starts hidden in the notification area when launched by you or Windows."
                           Checked="MinimizeToTrayCheck_Changed"
                           Unchecked="MinimizeToTrayCheck_Changed"/>
                 <Button Content="Hide" Click="HideButton_Click" ToolTip="Hide WindowHome to the notification area."/>

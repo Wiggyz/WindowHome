@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.IO;
 using System.Text.Json.Serialization;
 
 namespace MonitorApp;
@@ -137,6 +139,100 @@ public sealed class WindowInfo
 }
 
 public readonly record struct RuleWindowAssignment(AppRule Rule, WindowInfo Window);
+
+public readonly record struct EditorIdentity(string DisplayName, string ProcessName, string ExecutablePath)
+{
+    public bool HasIdentity =>
+        !string.IsNullOrWhiteSpace(DisplayName)
+        || !string.IsNullOrWhiteSpace(ProcessName)
+        || !string.IsNullOrWhiteSpace(ExecutablePath);
+}
+
+public static class EditorFieldAutomation
+{
+    public static EditorIdentity CreateIdentityFromExecutable(string executablePath)
+    {
+        var normalizedName = Path.GetFileNameWithoutExtension(executablePath?.Trim() ?? "");
+        return new EditorIdentity(normalizedName, normalizedName, executablePath?.Trim() ?? "");
+    }
+
+    public static EditorIdentity CreateIdentityFromWindow(WindowInfo window)
+    {
+        var processName = NormalizeProcessName(window.ProcessName);
+        return new EditorIdentity(processName, processName, window.ExecutablePath);
+    }
+
+    public static EditorIdentity ResolveIdentityForPositionSave(EditorIdentity editorIdentity, WindowInfo window)
+    {
+        return editorIdentity.HasIdentity ? Normalize(editorIdentity) : CreateIdentityFromWindow(window);
+    }
+
+    public static bool MatchesRule(AppRule rule, EditorIdentity identity)
+    {
+        var normalized = Normalize(identity);
+        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath) && !string.IsNullOrWhiteSpace(normalized.ExecutablePath))
+        {
+            return string.Equals(rule.ExecutablePath, normalized.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return !string.IsNullOrWhiteSpace(normalized.ProcessName)
+            && string.Equals(NormalizeProcessName(rule.ProcessName), normalized.ProcessName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static EditorIdentity Normalize(EditorIdentity identity)
+    {
+        var executablePath = identity.ExecutablePath?.Trim() ?? "";
+        var processName = NormalizeProcessName(string.IsNullOrWhiteSpace(identity.ProcessName) ? executablePath : identity.ProcessName);
+        var displayName = string.IsNullOrWhiteSpace(identity.DisplayName)
+            ? processName
+            : identity.DisplayName.Trim();
+        return new EditorIdentity(displayName, processName, executablePath);
+    }
+
+    private static string NormalizeProcessName(string value)
+    {
+        return Path.GetFileNameWithoutExtension(value?.Trim() ?? "");
+    }
+}
+
+public static class SaveAutomation
+{
+    public static bool ShouldHideOnLaunch(bool startMinimizedToTray)
+    {
+        return startMinimizedToTray;
+    }
+
+    public static AppRule CreateManualRule(EditorIdentity identity, MonitorInfo monitor)
+    {
+        return new AppRule
+        {
+            DisplayName = string.IsNullOrWhiteSpace(identity.DisplayName)
+                ? Path.GetFileNameWithoutExtension(identity.ExecutablePath.Length > 0 ? identity.ExecutablePath : identity.ProcessName)
+                : identity.DisplayName.Trim(),
+            ExecutablePath = identity.ExecutablePath.Trim(),
+            ProcessName = string.IsNullOrWhiteSpace(identity.ProcessName)
+                ? Path.GetFileNameWithoutExtension(identity.ExecutablePath)
+                : Path.GetFileNameWithoutExtension(identity.ProcessName),
+            TargetMonitorDeviceName = monitor.DeviceName,
+            TargetMonitorLabel = monitor.DisplayName,
+            Enabled = true
+        };
+    }
+}
+
+public static class LaunchAutomation
+{
+    public static ProcessStartInfo CreateStartInfo(AppRule rule)
+    {
+        return new ProcessStartInfo
+        {
+            FileName = rule.ExecutablePath,
+            UseShellExecute = true,
+            WindowStyle = ProcessWindowStyle.Normal,
+            WorkingDirectory = Path.GetDirectoryName(rule.ExecutablePath) ?? ""
+        };
+    }
+}
 
 public sealed class WindowRect
 {

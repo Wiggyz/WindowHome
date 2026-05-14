@@ -50,7 +50,6 @@ public partial class MainWindow : Window
     private WinEventDelegate? _winEventDelegate;
     private nint _windowEventHook;
     private int _iconFrameIndex;
-    private bool _exitRequested;
     private bool _syncingStartupChecks;
 
     public MainWindow()
@@ -110,7 +109,7 @@ public partial class MainWindow : Window
         _pollTimer.Start();
         _iconAnimationTimer.Start();
         SetStatus($"Rules stored: {_stateService.SettingsPath}");
-        if (_settings.MinimizeToTray && ShouldStartMinimizedToTray())
+        if (SaveAutomation.ShouldHideOnLaunch(_settings.MinimizeToTray))
         {
             Dispatcher.BeginInvoke(HideToTray);
         }
@@ -303,7 +302,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            var rule = SaveRuleFromEditor();
+            var rule = SaveRuleFromEditor(appendOnly: true);
             if (rule is not null)
             {
                 SetStatus($"Saved {rule.DisplayName}.");
@@ -315,7 +314,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private AppRule? SaveRuleFromEditor()
+    private AppRule? SaveRuleFromEditor(bool appendOnly)
     {
         if (MonitorCombo.SelectedItem is not MonitorInfo monitor)
         {
@@ -331,14 +330,21 @@ public partial class MainWindow : Window
             return null;
         }
 
-        var rule = _selectedRule ?? new AppRule();
-        rule.DisplayName = string.IsNullOrWhiteSpace(NameBox.Text)
-            ? Path.GetFileNameWithoutExtension(exePath.Length > 0 ? exePath : processName)
-            : NameBox.Text.Trim();
-        rule.ExecutablePath = exePath;
-        rule.ProcessName = string.IsNullOrWhiteSpace(processName)
-            ? Path.GetFileNameWithoutExtension(exePath)
-            : Path.GetFileNameWithoutExtension(processName);
+        var rule = appendOnly || _selectedRule is null
+            ? SaveAutomation.CreateManualRule(ReadRuleEditorIdentity(), monitor)
+            : _selectedRule;
+
+        if (!appendOnly && _selectedRule is not null)
+        {
+            rule.DisplayName = string.IsNullOrWhiteSpace(NameBox.Text)
+                ? Path.GetFileNameWithoutExtension(exePath.Length > 0 ? exePath : processName)
+                : NameBox.Text.Trim();
+            rule.ExecutablePath = exePath;
+            rule.ProcessName = string.IsNullOrWhiteSpace(processName)
+                ? Path.GetFileNameWithoutExtension(exePath)
+                : Path.GetFileNameWithoutExtension(processName);
+        }
+
         rule.TargetMonitorDeviceName = monitor.DeviceName;
         rule.TargetMonitorLabel = monitor.DisplayName;
         rule.WindowState = ReadEditorWindowState();
@@ -359,12 +365,12 @@ public partial class MainWindow : Window
             };
         }
 
-        if (_selectedRule is null)
+        if (appendOnly || _selectedRule is null)
         {
             _settings.Rules.Add(rule);
-            _selectedRule = rule;
         }
 
+        _selectedRule = rule;
         SaveSettings();
         BindRules();
         RulesList.SelectedItem = rule;
@@ -453,12 +459,7 @@ public partial class MainWindow : Window
 
         if (dialog.ShowDialog(this) == true)
         {
-            ExePathBox.Text = dialog.FileName;
-            ProcessNameBox.Text = Path.GetFileNameWithoutExtension(dialog.FileName);
-            if (string.IsNullOrWhiteSpace(NameBox.Text))
-            {
-                NameBox.Text = Path.GetFileNameWithoutExtension(dialog.FileName);
-            }
+            ApplyRuleEditorIdentity(EditorFieldAutomation.CreateIdentityFromExecutable(dialog.FileName));
         }
     }
 
@@ -470,9 +471,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        NameBox.Text = window.ProcessName;
-        ProcessNameBox.Text = window.ProcessName;
-        ExePathBox.Text = window.ExecutablePath;
+        ApplyRuleEditorIdentity(EditorFieldAutomation.CreateIdentityFromWindow(window));
         SetStatus($"Using {window.ProcessName}.");
     }
 
@@ -525,14 +524,11 @@ public partial class MainWindow : Window
             }
 
             var position = _windowService.CapturePosition(window, monitor);
-            var existingRule = _selectedRule is not null && ShouldOverwriteSelectedRuleWithWindow(_selectedRule, window)
-                ? _selectedRule
-                : null;
+            var editorIdentity = ReadRuleEditorIdentity();
+            var existingRule = FindRuleForEditorIdentity(editorIdentity);
             SelectRuleForOverwrite(existingRule);
 
-            NameBox.Text = window.ProcessName;
-            ProcessNameBox.Text = window.ProcessName;
-            ExePathBox.Text = window.ExecutablePath;
+            ApplyRuleEditorIdentity(EditorFieldAutomation.ResolveIdentityForPositionSave(editorIdentity, window));
             MonitorCombo.SelectedItem = monitor;
             var state = _windowService.CaptureWindowState(window);
             SetModeFromWindowState(state);
@@ -541,7 +537,7 @@ public partial class MainWindow : Window
             WidthBox.Text = position.Width.ToString();
             HeightBox.Text = position.Height.ToString();
 
-            var savedRule = SaveRuleFromEditor();
+            var savedRule = SaveRuleFromEditor(appendOnly: false);
             if (savedRule is not null)
             {
                 _appliedWindows.Add(window.Handle);
@@ -583,23 +579,19 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool ShouldOverwriteSelectedRuleWithWindow(AppRule rule, WindowInfo window)
+    private AppRule? FindRuleForEditorIdentity(EditorIdentity identity)
     {
-        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath) && !string.IsNullOrWhiteSpace(window.ExecutablePath))
+        if (!identity.HasIdentity)
         {
-            return string.Equals(rule.ExecutablePath, window.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+            return _selectedRule;
         }
 
-        if (!string.IsNullOrWhiteSpace(rule.ExecutablePath))
+        if (_selectedRule is not null && EditorFieldAutomation.MatchesRule(_selectedRule, identity))
         {
-            return false;
+            return _selectedRule;
         }
 
-        return !string.IsNullOrWhiteSpace(rule.ProcessName)
-            && string.Equals(
-                Path.GetFileNameWithoutExtension(rule.ProcessName),
-                Path.GetFileNameWithoutExtension(window.ProcessName),
-                StringComparison.OrdinalIgnoreCase);
+        return _settings.Rules.FirstOrDefault(rule => EditorFieldAutomation.MatchesRule(rule, identity));
     }
 
     private void NewRuleButton_Click(object sender, RoutedEventArgs e)
@@ -819,16 +811,13 @@ public partial class MainWindow : Window
             return false;
         }
 
-        var startInfo = new ProcessStartInfo
+        if (RuleAutomation.IsAlreadyRunning(rule, GetRunningProcesses()))
         {
-            FileName = rule.ExecutablePath,
-            UseShellExecute = true,
-            WindowStyle = rule.EffectiveWindowState == SavedWindowState.MinimizedToTaskbar
-                ? ProcessWindowStyle.Minimized
-                : ProcessWindowStyle.Normal
-        };
+            SetStatus($"{rule.DisplayName} already running.");
+            return false;
+        }
 
-        Process.Start(startInfo);
+        Process.Start(LaunchAutomation.CreateStartInfo(rule));
         ScheduleApplySavedRules();
         return true;
     }
@@ -848,23 +837,13 @@ public partial class MainWindow : Window
 
     private void MainWindow_Closing(object? sender, CancelEventArgs e)
     {
-        if (_exitRequested)
+        StopWindowEventHooks();
+        _pollTimer.Stop();
+        _iconAnimationTimer.Stop();
+        _trayIcon?.Dispose();
+        foreach (var icon in _trayAnimationIcons)
         {
-            StopWindowEventHooks();
-            _pollTimer.Stop();
-            _iconAnimationTimer.Stop();
-            _trayIcon?.Dispose();
-            foreach (var icon in _trayAnimationIcons)
-            {
-                icon.Dispose();
-            }
-            return;
-        }
-
-        if (MinimizeToTrayCheck.IsChecked == true)
-        {
-            e.Cancel = true;
-            HideToTray();
+            icon.Dispose();
         }
     }
 
@@ -939,7 +918,6 @@ public partial class MainWindow : Window
         _trayIcon.ContextMenuStrip.Items.Add("Show", null, (_, _) => ShowFromTray());
         _trayIcon.ContextMenuStrip.Items.Add("Exit", null, (_, _) =>
         {
-            _exitRequested = true;
             _trayIcon.Visible = false;
             Close();
         });
@@ -1138,9 +1116,7 @@ public partial class MainWindow : Window
     private void ClearEditor()
     {
         _selectedRule = null;
-        NameBox.Text = "";
-        ExePathBox.Text = "";
-        ProcessNameBox.Text = "";
+        ApplyRuleEditorIdentity(new EditorIdentity("", "", ""));
         ModeCombo.SelectedIndex = 0;
         TrayActionCombo.SelectedIndex = 0;
         RuleAutoStartCheck.IsChecked = false;
@@ -1156,6 +1132,18 @@ public partial class MainWindow : Window
     {
         UpdateRuleMonitorLabels();
         _stateService.Save(_settings);
+    }
+
+    private EditorIdentity ReadRuleEditorIdentity()
+    {
+        return new EditorIdentity(NameBox.Text.Trim(), ProcessNameBox.Text.Trim(), ExePathBox.Text.Trim());
+    }
+
+    private void ApplyRuleEditorIdentity(EditorIdentity identity)
+    {
+        NameBox.Text = identity.DisplayName;
+        ProcessNameBox.Text = identity.ProcessName;
+        ExePathBox.Text = identity.ExecutablePath;
     }
 
     private void SetStatus(string message)

@@ -10,6 +10,9 @@
     <ApplicationIcon>Assets\WindowHome.ico</ApplicationIcon>
     <AssemblyName>WindowHome</AssemblyName>
     <Product>WindowHome</Product>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>

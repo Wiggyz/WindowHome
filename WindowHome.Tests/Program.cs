@@ -154,6 +154,46 @@ TestAssert.True(createTaskArgs.Contains("/IT", StringComparison.OrdinalIgnoreCas
 TestAssert.True(createTaskArgs.Contains("--minimized-to-tray", StringComparison.OrdinalIgnoreCase), "Elevated startup task should preserve minimized-to-tray startup.");
 TestAssert.True(ElevatedStartupTask.BuildDeleteArguments().Contains(ElevatedStartupTask.TaskName, StringComparison.Ordinal), "Elevated startup delete command should target WindowHome task.");
 
+var selectedWindow = Window((nint)404, "explorer", @"C:\Windows\explorer.exe");
+var editorIdentity = new EditorIdentity("Patrik", "PatrikZeros_Sound_Mixer", @"C:\Program Files (x86)\PatrikZero's Sound Mixer\PatrikZeros_Sound_Mixer.exe");
+var resolvedIdentity = EditorFieldAutomation.ResolveIdentityForPositionSave(editorIdentity, selectedWindow);
+TestAssert.True(resolvedIdentity.DisplayName == "Patrik", "Save current position should keep rule editor name when an executable was chosen.");
+TestAssert.True(resolvedIdentity.ProcessName == "PatrikZeros_Sound_Mixer", "Save current position should keep rule editor process when an executable was chosen.");
+TestAssert.True(resolvedIdentity.ExecutablePath == @"C:\Program Files (x86)\PatrikZero's Sound Mixer\PatrikZeros_Sound_Mixer.exe", "Save current position should keep rule editor executable when an executable was chosen.");
+
+var fallbackIdentity = EditorFieldAutomation.ResolveIdentityForPositionSave(new EditorIdentity("", "", ""), selectedWindow);
+TestAssert.True(fallbackIdentity.ProcessName == "explorer", "Blank rule editor should fall back to current window process.");
+TestAssert.True(fallbackIdentity.ExecutablePath == @"C:\Windows\explorer.exe", "Blank rule editor should fall back to current window executable.");
+
+var exeIdentity = EditorFieldAutomation.CreateIdentityFromExecutable(@"D:\Games\Steam\steam.exe");
+TestAssert.True(exeIdentity.DisplayName == "steam", "Choosing a new executable should replace editor name with the executable name.");
+TestAssert.True(exeIdentity.ProcessName == "steam", "Choosing a new executable should replace editor process with the executable name.");
+TestAssert.True(exeIdentity.ExecutablePath == @"D:\Games\Steam\steam.exe", "Choosing a new executable should replace editor executable path.");
+
+var primaryMonitor = new MonitorInfo
+{
+    DeviceName = @"\\.\DISPLAY1",
+    DisplayName = "Primary",
+    Bounds = new ScreenRect { Left = 0, Top = 0, Width = 1920, Height = 1080 },
+    WorkArea = new ScreenRect { Left = 0, Top = 0, Width = 1920, Height = 1040 },
+    IsPrimary = true
+};
+var oldRule = new AppRule { DisplayName = "Old", ProcessName = "old", ExecutablePath = @"C:\Apps\old.exe" };
+var newRule = SaveAutomation.CreateManualRule(new EditorIdentity("New", "newapp", @"C:\Apps\newapp.exe"), primaryMonitor);
+TestAssert.True(newRule.Id != oldRule.Id, "Save Rule should create a new saved app instead of overwriting selected apps.");
+TestAssert.True(newRule.DisplayName == "New", "Save Rule should use current editor identity for the new saved app.");
+
+TestAssert.True(SaveAutomation.ShouldHideOnLaunch(true), "Checked start-minimized-to-tray should hide WindowHome on launch.");
+TestAssert.True(!SaveAutomation.ShouldHideOnLaunch(false), "Unchecked start-minimized-to-tray should leave WindowHome visible on launch.");
+
+var launchInfo = LaunchAutomation.CreateStartInfo(new AppRule
+{
+    ExecutablePath = @"C:\Program Files (x86)\PatrikZero's Sound Mixer\PatrikZeros_Sound_Mixer.exe",
+    WindowState = SavedWindowState.MinimizedToTaskbar
+});
+TestAssert.True(launchInfo.WindowStyle == ProcessWindowStyle.Normal, "Apps should always launch normally so fragile startup flows do not crash on forced minimized start.");
+TestAssert.True(launchInfo.WorkingDirectory == @"C:\Program Files (x86)\PatrikZero's Sound Mixer", "App launch should use executable folder as working directory for apps that load relative assets.");
+
 Console.WriteLine("WindowHome.Tests passed.");
 
 internal static class TestAssert
